@@ -1,0 +1,993 @@
+import os
+import re
+import tempfile
+import logging
+import asyncio
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Set, Optional
+import pytz
+import sqlite3
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+
+from .models import Task
+from .database import TaskDatabase
+from .auth import AuthMiddleware
+
+logger = logging.getLogger(__name__)
+
+class BotHandlers:
+    """Класс с обработчиками команд Telegram"""
+    
+    AVAILABLE_STATUSES = ['TODO', 'DOING', 'DONE', 'NOW', 'LATER', 'WAITING', 'CANCELED']
+    
+    def __init__(self, parser, classifier, motivator, db, voice_creator, allowed_user_ids):
+        self.parser = parser
+        self.classifier = classifier
+        self.motivator = motivator
+        self.db = db
+        self.voice_creator = voice_creator
+        self.auth = AuthMiddleware(allowed_user_ids)
+    
+    async def _check_auth(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """
+        Проверяет авторизацию пользователя
+        Если не авторизован - отправляет сообщение и возвращает False
+        """
+        if not await self.auth.check_auth(update, context):
+            await self.auth.handle_unauthorized(update, context)
+            return False
+        return True
+    
+    async def _check_auth_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """
+        Проверяет авторизацию для callback запросов
+        """
+        if not await self.auth.check_auth(update, context):
+            await self.auth.handle_unauthorized_callback(update, context)
+            return False
+        return True
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /start"""
+        if not await self._check_auth(update, context):
+            return
+        
+        welcome_text = """
+👋 Привет! Я бот для мотивации выполнения задач из Logseq.
+
+Я анализирую твои задачи в формате Logseq и помогаю с мотивацией.
+Особенность: я умею отличать рабочие задачи от личных!
+
+НОВОЕ! Теперь ты можешь создавать задачи голосом! 🎤
+Просто отправь мне голосовое сообщение, и я создам задачу в Logseq.
+
+Команды:
+/tasks - показать все задачи (с фильтрами по дате и статусам)
+/work - показать только рабочие задачи
+/personal - показать только личные задачи
+/motivate - получить мотивацию по всем задачам
+/motivate_work - мотивация только по рабочим
+/motivate_personal - мотивация только по личным
+/stats - статистика по задачам
+/filter - настроить фильтр по статусам
+/notifications - настройки уведомлений
+/settings - все настройки
+/help - помощь
+
+Для начала работы:
+1. Укажи путь к твоей базе Logseq: /setpath /путь/к/logseq
+2. Настрой время уведомлений: /set_time 09:00
+3. Укажи часовой пояс: /set_timezone Europe/Moscow
+        """
+        await update.message.reply_text(welcome_text)
+    
+    async def handle_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обрабатывает голосовые сообщения"""
+        if not await self._check_auth(update, context):
+            return
+        
+        voice = update.message.voice
+        
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        processing_msg = await update.message.reply_text("🎤 Обрабатываю голосовое сообщение...\nЭто может занять несколько секунд")
+        
+        try:
+            voice_file = await voice.get_file()
+            
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp_file:
+                file_path = tmp_file.name
+                await voice_file.download_to_drive(file_path)
+            
+            logger.info(f"Голосовой файл скачан: {file_path}, размер: {os.path.getsize(file_path)} байт")
+            
+            await processing_msg.edit_text("🎤 Анализирую голосовое сообщение...\nКонвертирую аудио и распознаю речь")
+            
+            success, result = await self.voice_creator.create_task_from_voice_async(file_path)
+            
+            if success:
+                await processing_msg.edit_text(result)
+            else:
+                await processing_msg.edit_text(result)
+                
+        except Exception as e:
+            logger.error(f"Ошибка при обработке голоса: {e}", exc_info=True)
+            await processing_msg.edit_text(f"❌ Ошибка при обработке голосового сообщения: {str(e)}")
+    
+    async def set_path(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает путь к Logseq"""
+        if not await self._check_auth(update, context):
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажи путь к папке Logseq, например:\n"
+                "/setpath /home/user/logseq\n"
+                "/setpath /home/user/Documents/logseq\n"
+                "/setpath /home/user/Logseq"
+            )
+            return
+        
+        path = ' '.join(context.args)
+        
+        if not os.path.exists(path):
+            await update.message.reply_text(f"❌ Путь не существует: {path}")
+            return
+        
+        journals_path = os.path.join(path, "journals")
+        pages_path = os.path.join(path, "pages")
+        
+        if not os.path.exists(journals_path) and not os.path.exists(pages_path):
+            await update.message.reply_text(
+                f"❌ В папке {path} не найдены подпапки 'journals' или 'pages'.\n"
+                "Убедись, что это правильная папка Logseq."
+            )
+            return
+        
+        context.user_data['logseq_path'] = path
+        self.parser.logseq_path = Path(path)
+        self.parser.journals_path = Path(path) / "journals"
+        self.parser.pages_path = Path(path) / "pages"
+        
+        self.voice_creator.logseq_path = Path(path)
+        self.voice_creator.journals_path = Path(path) / "journals"
+        self.voice_creator.pages_path = Path(path) / "pages"
+        self.voice_creator.journals_path.mkdir(exist_ok=True)
+        self.voice_creator.pages_path.mkdir(exist_ok=True)
+        
+        tasks = self.parser.parse_all_tasks()
+        await update.message.reply_text(
+            f"✅ Путь установлен: {path}\n"
+            f"Найдено задач за последние {self.parser.max_months} месяцев: {len(tasks)}"
+        )
+    
+    def _get_status_emoji(self, status: Optional[str]) -> str:
+        """Возвращает эмодзи для статуса задачи"""
+        emoji_map = {
+            'TODO': '📝',
+            'DOING': '⚡',
+            'DONE': '✅',
+            'NOW': '🔥',
+            'LATER': '⏳',
+            'WAITING': '⏸️',
+            'CANCELED': '❌'
+        }
+        return emoji_map.get(status, '📌')
+    
+    def _get_task_age_info(self, task: Task) -> str:
+        """Возвращает информацию о возрасте задачи"""
+        if task.created_date:
+            days_old = (datetime.now() - task.created_date).days
+            if days_old > 0:
+                if days_old < 30:
+                    return f"(создано {days_old} дн. назад)"
+                elif days_old < 90:
+                    months = days_old // 30
+                    return f"(создано {months} мес. назад)"
+        return ""
+    
+    async def _classify_tasks(self, tasks: List[Task]) -> List[Task]:
+        """Классифицирует задачи на рабочие/личные"""
+        classified_tasks = []
+        for task in tasks:
+            if task.is_work is None:
+                task.is_work = await self.classifier.is_work_task(task)
+            classified_tasks.append(task)
+        return classified_tasks
+    
+    async def show_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE, task_type: str = "all"):
+        """Показывает ВСЕ задачи с учетом фильтров"""
+        if not await self._check_auth(update, context):
+            return
+        
+        try:
+            user_id = update.effective_user.id
+            settings = self.db.get_user_settings(user_id)
+            status_filter = set(settings["status_filter"])
+            
+            all_tasks = self.parser.parse_all_tasks(filter_by_date=True, status_filter=status_filter)
+            all_tasks = await self._classify_tasks(all_tasks)
+            
+            if not all_tasks:
+                period_text = f"за последние {self.parser.max_months} месяцев" if self.parser.max_months > 0 else ""
+                await update.message.reply_text(
+                    f"❌ Не найдено задач {period_text}.\n"
+                    "Проверь:\n"
+                    "1. Правильный ли путь к Logseq (/setpath)\n"
+                    "2. Есть ли задачи в файлах"
+                )
+                return
+            
+            if task_type == "work":
+                filtered_tasks = [t for t in all_tasks if t.is_work]
+                type_emoji = "💼"
+                type_text = "РАБОЧИЕ"
+            elif task_type == "personal":
+                filtered_tasks = [t for t in all_tasks if t.is_work is False]
+                type_emoji = "🏠"
+                type_text = "ЛИЧНЫЕ"
+            else:
+                filtered_tasks = all_tasks
+                type_emoji = "📋"
+                type_text = "ВСЕ"
+            
+            if not filtered_tasks:
+                await update.message.reply_text(
+                    f"{type_emoji} Нет {type_text.lower()} задач по текущему фильтру.\n"
+                    f"Попробуй другой тип задач или измени фильтр статусов (/filter)."
+                )
+                return
+            
+            incomplete_tasks = [t for t in filtered_tasks if not t.completed]
+            completed_tasks = [t for t in filtered_tasks if t.completed]
+            
+            now = datetime.now()
+            
+            tasks_by_status = {}
+            for status in self.AVAILABLE_STATUSES:
+                if status in status_filter:
+                    tasks_by_status[status] = [t for t in incomplete_tasks if t.status == status]
+            
+            overdue = [t for t in incomplete_tasks if t.deadline and t.deadline < now]
+            today = [t for t in incomplete_tasks if t.deadline and t.deadline.date() == now.date()]
+            
+            period_text = f"за последние {self.parser.max_months} месяцев" if self.parser.max_months > 0 else "за всё время"
+            status_text = ', '.join([f"{self._get_status_emoji(s)} {s}" for s in status_filter if s in tasks_by_status])
+            
+            message = f"{type_emoji} {type_text} ЗАДАЧИ {period_text}\n"
+            message += f"🎯 Фильтр статусов: {status_text}\n"
+            message += f"📊 Всего: {len(incomplete_tasks)} активных, {len(completed_tasks)} выполненных\n\n"
+            
+            work_count = len([t for t in incomplete_tasks if t.is_work])
+            personal_count = len([t for t in incomplete_tasks if t.is_work is False])
+            message += f"💼 Рабочих: {work_count} | 🏠 Личных: {personal_count}\n\n"
+            
+            if overdue:
+                message += "🔴 Просроченные:\n"
+                for task in overdue:
+                    days = (now - task.deadline).days
+                    status_emoji = self._get_status_emoji(task.status)
+                    work_marker = "💼 " if task.is_work else "🏠 "
+                    age_info = self._get_task_age_info(task)
+                    deadline_str = task.deadline.strftime("%d.%m.%Y")
+                    message += f"• {work_marker}{status_emoji} {task.content} (дедлайн: {deadline_str}, просрочено {days} дн.) {age_info}\n"
+                    if task.tags:
+                        message += f"  {' '.join(['#'+t for t in task.tags])}\n"
+                message += "\n"
+            
+            if today:
+                message += "🔥 На сегодня:\n"
+                for task in today:
+                    status_emoji = self._get_status_emoji(task.status)
+                    work_marker = "💼 " if task.is_work else "🏠 "
+                    age_info = self._get_task_age_info(task)
+                    deadline_str = task.deadline.strftime("%d.%m.%Y")
+                    message += f"• {work_marker}{status_emoji} {task.content} (дедлайн: {deadline_str}) {age_info}\n"
+                    if task.tags:
+                        message += f"  {' '.join(['#'+t for t in task.tags])}\n"
+                message += "\n"
+            
+            for status in ['NOW', 'DOING', 'TODO', 'LATER', 'WAITING']:
+                if status in tasks_by_status and tasks_by_status[status]:
+                    status_emoji = self._get_status_emoji(status)
+                    status_name = {
+                        'NOW': 'Сейчас',
+                        'DOING': 'В процессе',
+                        'TODO': 'К выполнению',
+                        'LATER': 'Отложенные',
+                        'WAITING': 'Ожидание'
+                    }.get(status, status)
+                    
+                    message += f"{status_emoji} {status_name}:\n"
+                    for task in tasks_by_status[status]:
+                        work_marker = "💼 " if task.is_work else "🏠 "
+                        age_info = self._get_task_age_info(task)
+                        deadline_info = ""
+                        if task.deadline:
+                            days_left = (task.deadline - now).days
+                            deadline_str = task.deadline.strftime("%d.%m.%Y")
+                            if days_left >= 0:
+                                deadline_info = f" (дедлайн: {deadline_str}, через {days_left} дн.)"
+                            else:
+                                deadline_info = f" (дедлайн: {deadline_str})"
+                        message += f"• {work_marker}{task.content}{deadline_info} {age_info}\n"
+                        if task.tags:
+                            message += f"  {' '.join(['#'+t for t in task.tags])}\n"
+                    message += "\n"
+            
+            if 'DONE' in status_filter and completed_tasks:
+                message += "✅ Недавно выполненные:\n"
+                for task in completed_tasks:
+                    work_marker = "💼 " if task.is_work else "🏠 "
+                    age_info = self._get_task_age_info(task)
+                    message += f"• {work_marker}{task.content} {age_info}\n"
+                    if task.tags:
+                        message += f"  {' '.join(['#'+t for t in task.tags])}\n"
+                message += "\n"
+            
+            message += f"---\n"
+            message += f"Фильтр по дате: {self.parser.max_months if self.parser.max_months > 0 else 'все'} мес.\n"
+            message += f"Фильтр по статусам: {len(status_filter)} статусов\n"
+            message += f"Всего задач в сообщении: {len(incomplete_tasks) + len(completed_tasks)}"
+            
+            keyboard = [
+                [InlineKeyboardButton("🎯 Мотивация (все)", callback_data="motivate"),
+                 InlineKeyboardButton("💼 Мотивация (работа)", callback_data="motivate_work")],
+                [InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+                 InlineKeyboardButton("🔔 Уведомления", callback_data="notifications")],
+                [InlineKeyboardButton("⏰ Период", callback_data="change_period"),
+                 InlineKeyboardButton("🎯 Статусы", callback_data="change_status_filter")],
+                [InlineKeyboardButton("🔄 Сбросить фильтры", callback_data="reset_filters")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            if len(message) > 4000:
+                parts = []
+                current_part = ""
+                
+                for line in message.split('\n'):
+                    if len(current_part) + len(line) + 1 < 4000:
+                        current_part += line + '\n'
+                    else:
+                        parts.append(current_part)
+                        current_part = line + '\n'
+                
+                if current_part:
+                    parts.append(current_part)
+                
+                for i, part in enumerate(parts):
+                    if i == len(parts) - 1:
+                        await update.message.reply_text(part, reply_markup=reply_markup)
+                    else:
+                        await update.message.reply_text(part)
+            else:
+                await update.message.reply_text(message, reply_markup=reply_markup)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при показе задач: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+    
+    async def show_work_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает только рабочие задачи"""
+        await self.show_tasks(update, context, task_type="work")
+    
+    async def show_personal_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает только личные задачи"""
+        await self.show_tasks(update, context, task_type="personal")
+    
+    async def motivate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Мотивация по всем задачам"""
+        if not await self._check_auth(update, context):
+            return
+        await self._send_motivation(update.effective_chat.id, context, focus_work=False)
+    
+    async def motivate_work(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Мотивация только по рабочим задачам"""
+        if not await self._check_auth(update, context):
+            return
+        await self._send_motivation(update.effective_chat.id, context, focus_work=True)
+    
+    async def motivate_personal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Мотивация только по личным задачам"""
+        if not await self._check_auth(update, context):
+            return
+        await self._send_motivation(update.effective_chat.id, context, focus_work=False, personal_only=True)
+    
+    async def _send_motivation(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
+                               focus_work: bool = False, personal_only: bool = False):
+        """Внутренний метод для отправки мотивации"""
+        try:
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            
+            user_id = chat_id
+            settings = self.db.get_user_settings(user_id)
+            status_filter = set(settings["status_filter"])
+            
+            all_tasks = self.parser.parse_all_tasks(filter_by_date=True, status_filter=status_filter)
+            all_tasks = await self._classify_tasks(all_tasks)
+            
+            if focus_work:
+                filtered_tasks = [t for t in all_tasks if t.is_work and not t.completed]
+                task_type_text = "рабочим"
+            elif personal_only:
+                filtered_tasks = [t for t in all_tasks if t.is_work is False and not t.completed]
+                task_type_text = "личным"
+            else:
+                filtered_tasks = [t for t in all_tasks if not t.completed]
+                task_type_text = "всем"
+            
+            if filtered_tasks:
+                motivation = await self.motivator.generate_motivation(filtered_tasks, focus_work=focus_work)
+                
+                for task in filtered_tasks[:10]:
+                    self.db.mark_task_sent(task.id, chat_id)
+                
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"💪 Мотивация по {task_type_text} задачам:\n\n{motivation}"
+                )
+            else:
+                task_type = "рабочих" if focus_work else "личных" if personal_only else ""
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🎉 Нет невыполненных {task_type} задач! Отличная работа!"
+                )
+                
+        except Exception as e:
+            logger.error(f"Ошибка при генерации мотивации: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Не удалось получить мотивацию. Попробуй позже."
+            )
+    
+    async def status_filter_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Меню настройки фильтра по статусам"""
+        if not await self._check_auth(update, context):
+            return
+        
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        current_filter = set(settings["status_filter"])
+        
+        text = "🎯 Настройка фильтра по статусам\n\n"
+        text += "Выбери какие статусы показывать в /tasks:\n\n"
+        
+        keyboard = []
+        row = []
+        
+        for i, status in enumerate(self.AVAILABLE_STATUSES):
+            emoji = self._get_status_emoji(status)
+            status_text = f"{emoji} {status}"
+            if status in current_filter:
+                status_text = f"✅ {status_text}"
+            
+            button = InlineKeyboardButton(status_text, callback_data=f"toggle_status_{status}")
+            row.append(button)
+            
+            if len(row) == 2 or i == len(self.AVAILABLE_STATUSES) - 1:
+                keyboard.append(row)
+                row = []
+        
+        keyboard.append([InlineKeyboardButton("✅ Выбрать все", callback_data="status_all"),
+                        InlineKeyboardButton("❌ Очистить все", callback_data="status_none")])
+        keyboard.append([InlineKeyboardButton("◀️ Назад к задачам", callback_data="back_to_tasks")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(text, reply_markup=reply_markup)
+    
+    async def toggle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Включает/выключает статус в фильтре"""
+        if not await self._check_auth_callback(update, context):
+            return
+        
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        status = query.data.replace("toggle_status_", "")
+        
+        settings = self.db.get_user_settings(user_id)
+        current_filter = set(settings["status_filter"])
+        
+        if status in current_filter:
+            current_filter.remove(status)
+        else:
+            current_filter.add(status)
+        
+        self.db.update_user_settings(user_id, status_filter=list(current_filter))
+        await self.status_filter_menu(update, context)
+    
+    async def set_all_statuses(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает все статусы или очищает"""
+        if not await self._check_auth_callback(update, context):
+            return
+        
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        action = query.data.replace("status_", "")
+        
+        if action == "all":
+            status_filter = self.AVAILABLE_STATUSES.copy()
+            await query.edit_message_text("✅ Показываю все статусы")
+        else:
+            status_filter = []
+            await query.edit_message_text("❌ Фильтр статусов очищен")
+        
+        self.db.update_user_settings(user_id, status_filter=status_filter)
+        await self.show_tasks(update, context)
+    
+    async def reset_filters(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сбрасывает фильтры к значениям по умолчанию"""
+        if not await self._check_auth_callback(update, context):
+            return
+        
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        default_filter = self.db.default_status_filter.copy()
+        
+        self.db.update_user_settings(user_id, status_filter=default_filter)
+        self.parser.max_months = 3
+        
+        await query.edit_message_text("🔄 Фильтры сброшены к значениям по умолчанию")
+        await self.show_tasks(update, context)
+    
+    async def change_period(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Изменяет период фильтрации задач"""
+        if not await self._check_auth_callback(update, context):
+            return
+        
+        query = update.callback_query
+        await query.answer()
+        
+        keyboard = [
+            [InlineKeyboardButton("1 месяц", callback_data="period_1")],
+            [InlineKeyboardButton("3 месяца", callback_data="period_3")],
+            [InlineKeyboardButton("6 месяцев", callback_data="period_6")],
+            [InlineKeyboardButton("Все задачи", callback_data="period_0")],
+            [InlineKeyboardButton("◀️ Назад к задачам", callback_data="back_to_tasks")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "⏰ Выбери период для отображения задач:\n\n"
+            "Задачи из папки journals фильтруются по дате в имени файла.\n"
+            "Задачи из pages показываются всегда.",
+            reply_markup=reply_markup
+        )
+    
+    async def set_period(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает период фильтрации"""
+        if not await self._check_auth_callback(update, context):
+            return
+        
+        query = update.callback_query
+        await query.answer()
+        
+        period = query.data.replace("period_", "")
+        
+        if period == "0":
+            self.parser.max_months = 0
+            await query.edit_message_text("✅ Показываю все задачи без ограничений")
+        else:
+            self.parser.max_months = int(period)
+            await query.edit_message_text(f"✅ Показываю задачи не старше {period} месяцев")
+        
+        await self.show_tasks(update, context)
+    
+    async def notification_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Настройки уведомлений"""
+        if not await self._check_auth(update, context):
+            return
+        
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        
+        text = f"""
+🔔 Настройки уведомлений
+
+Ежедневная сводка: {'✅ Вкл' if settings['notify_daily'] else '❌ Выкл'}
+• Отправляется каждый день в {settings['notify_time']}
+• Содержит статистику по всем задачам
+
+Просроченные задачи: {'✅ Вкл' if settings['notify_overdue'] else '❌ Выкл'}
+• Уведомление при появлении просроченных задач
+• Не чаще раза в 12 часов
+
+Рабочие задачи: {'✅ Вкл' if settings['notify_work'] else '❌ Выкл'}
+• Напоминания о рабочих задачах в рабочее время (9:00-18:00)
+• Не чаще раза в 3 часа
+
+Команды для управления:
+/toggle_daily - вкл/выкл ежедневную сводку
+/toggle_overdue - вкл/выкл уведомления о просроченных
+/toggle_work - вкл/выкл напоминания о рабочих задачах
+/set_time ЧЧ:ММ - установить время для ежедневной сводки
+        """
+        
+        keyboard = [
+            [InlineKeyboardButton("📊 Ежедневная сводка", callback_data="toggle_daily"),
+             InlineKeyboardButton("⚠️ Просроченные", callback_data="toggle_overdue")],
+            [InlineKeyboardButton("💼 Рабочие задачи", callback_data="toggle_work"),
+             InlineKeyboardButton("◀️ Назад к настройкам", callback_data="back_to_settings")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(text, reply_markup=reply_markup)
+    
+    async def toggle_notification(self, update: Update, context: ContextTypes.DEFAULT_TYPE, notif_type: str):
+        """Включает/выключает определенный тип уведомлений"""
+        if not await self._check_auth_callback(update, context):
+            return
+        
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        
+        if notif_type == "daily":
+            new_value = not settings['notify_daily']
+            self.db.update_user_settings(user_id, notify_daily=new_value)
+            status = "включена" if new_value else "выключена"
+            await query.edit_message_text(f"✅ Ежедневная сводка {status}")
+        
+        elif notif_type == "overdue":
+            new_value = not settings['notify_overdue']
+            self.db.update_user_settings(user_id, notify_overdue=new_value)
+            status = "включены" if new_value else "выключены"
+            await query.edit_message_text(f"✅ Уведомления о просроченных задачах {status}")
+        
+        elif notif_type == "work":
+            new_value = not settings['notify_work']
+            self.db.update_user_settings(user_id, notify_work=new_value)
+            status = "включены" if new_value else "выключены"
+            await query.edit_message_text(f"✅ Напоминания о рабочих задачах {status}")
+        
+        await asyncio.sleep(1)
+        await self.notification_settings(update, context)
+    
+    async def toggle_daily(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Включает/выключает ежедневную сводку"""
+        if not await self._check_auth(update, context):
+            return
+        
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        
+        new_value = not settings['notify_daily']
+        self.db.update_user_settings(user_id, notify_daily=new_value)
+        
+        status = "включена" if new_value else "выключена"
+        await update.message.reply_text(f"✅ Ежедневная сводка {status}")
+    
+    async def toggle_overdue(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Включает/выключает уведомления о просроченных задачах"""
+        if not await self._check_auth(update, context):
+            return
+        
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        
+        new_value = not settings['notify_overdue']
+        self.db.update_user_settings(user_id, notify_overdue=new_value)
+        
+        status = "включены" if new_value else "выключены"
+        await update.message.reply_text(f"✅ Уведомления о просроченных задачах {status}")
+    
+    async def toggle_work_notify(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Включает/выключает напоминания о рабочих задачах"""
+        if not await self._check_auth(update, context):
+            return
+        
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        
+        new_value = not settings['notify_work']
+        self.db.update_user_settings(user_id, notify_work=new_value)
+        
+        status = "включены" if new_value else "выключены"
+        await update.message.reply_text(f"✅ Напоминания о рабочих задачах {status}")
+    
+    async def toggle_work(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Алиас для toggle_work_notify"""
+        await self.toggle_work_notify(update, context)
+    
+    async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает статистику по задачам"""
+        if not await self._check_auth(update, context):
+            return
+        
+        try:
+            user_id = update.effective_user.id
+            settings = self.db.get_user_settings(user_id)
+            status_filter = set(settings["status_filter"])
+            
+            all_tasks = self.parser.parse_all_tasks(filter_by_date=True)
+            all_tasks = await self._classify_tasks(all_tasks)
+            
+            if not all_tasks:
+                await update.message.reply_text("❌ Нет данных для статистики")
+                return
+            
+            status_stats = {}
+            for task in all_tasks:
+                status = task.status or 'без статуса'
+                status_stats[status] = status_stats.get(status, 0) + 1
+            
+            work_count = len([t for t in all_tasks if t.is_work])
+            personal_count = len([t for t in all_tasks if t.is_work is False])
+            unknown_count = len([t for t in all_tasks if t.is_work is None])
+            filtered_count = len([t for t in all_tasks if t.status in status_filter])
+            
+            now = datetime.now()
+            overdue = len([t for t in all_tasks if not t.completed and t.deadline and t.deadline < now])
+            due_today = len([t for t in all_tasks if not t.completed and t.deadline and t.deadline.date() == now.date()])
+            high_priority = len([t for t in all_tasks if not t.completed and t.priority == "высокий"])
+            young_tasks = len([t for t in all_tasks if t.created_date and (datetime.now() - t.created_date).days < 30])
+            
+            period_text = f"за последние {self.parser.max_months} месяцев" if self.parser.max_months > 0 else "за всё время"
+            
+            stats_text = f"""
+📊 Статистика задач Logseq {period_text}:
+
+Общая статистика:
+📋 Всего задач: {len(all_tasks)}
+🎯 По текущему фильтру: {filtered_count}
+
+Типы задач:
+💼 Рабочих: {work_count}
+🏠 Личных: {personal_count}
+❓ Не определено: {unknown_count}
+
+Статусы задач:
+{chr(10).join([f"{self._get_status_emoji(status)} {status}: {count}" for status, count in sorted(status_stats.items()) if status != 'без статуса'])}
+
+Срочность:
+⚠️ Просрочено: {overdue}
+🔥 На сегодня: {due_today}
+
+Приоритеты:
+🔴 Высокий приоритет: {high_priority}
+
+Возраст задач:
+🌱 Молодые (<30 дней): {young_tasks}
+            """
+            
+            keyboard = [
+                [InlineKeyboardButton("◀️ Назад к задачам", callback_data="back_to_tasks")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(stats_text, reply_markup=reply_markup)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при показе статистики: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+    
+    async def settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Все настройки пользователя"""
+        if not await self._check_auth(update, context):
+            return
+        
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        
+        status_text = ', '.join([f"{self._get_status_emoji(s)} {s}" for s in settings["status_filter"]])
+        
+        settings_text = f"""
+⚙️ Все настройки:
+
+Основные:
+Время уведомлений: {settings['notify_time']}
+Часовой пояс: {settings['timezone']}
+Автомотивация: {'✅ Вкл' if settings['auto_motivation'] else '❌ Выкл'}
+
+Фильтры:
+Период фильтрации: {self.parser.max_months if self.parser.max_months > 0 else 'Все задачи'} мес.
+Фильтр статусов: {status_text}
+
+Уведомления:
+📊 Ежедневная сводка: {'✅' if settings['notify_daily'] else '❌'}
+⚠️ О просроченных: {'✅' if settings['notify_overdue'] else '❌'}
+💼 О рабочих задачах: {'✅' if settings['notify_work'] else '❌'}
+
+Голосовые задачи:
+📄 Файл: {self.voice_creator._get_daily_journal_path().name}
+📝 Статус: DOING
+🤖 Автоклассификация: {'✅' if self.voice_creator.classifier else '❌'}
+
+Команды:
+/set_time ЧЧ:ММ - установить время
+/set_timezone Europe/Moscow - установить часовой пояс
+/toggle_auto - вкл/выкл автомотивацию
+/filter - настроить фильтр статусов
+/notifications - настроить уведомления
+        """
+        
+        keyboard = [
+            [InlineKeyboardButton("🔔 Настройки уведомлений", callback_data="notifications")],
+            [InlineKeyboardButton("🎯 Фильтр статусов", callback_data="change_status_filter")],
+            [InlineKeyboardButton("⏰ Период фильтрации", callback_data="change_period")],
+            [InlineKeyboardButton("◀️ Назад к задачам", callback_data="back_to_tasks")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(settings_text, reply_markup=reply_markup)
+    
+    async def set_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает время уведомлений"""
+        if not await self._check_auth(update, context):
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажи время в формате ЧЧ:ММ, например:\n"
+                "/set_time 09:00\n"
+                "/set_time 18:30"
+            )
+            return
+        
+        time_str = context.args[0]
+        if not re.match(r'^([0-1][0-9]|2[0-3]):[0-5][0-9]$', time_str):
+            await update.message.reply_text(
+                "❌ Неправильный формат. Используй ЧЧ:ММ (например, 09:00 или 18:30)"
+            )
+            return
+        
+        self.db.update_user_settings(update.effective_user.id, notify_time=time_str)
+        await update.message.reply_text(f"✅ Время уведомлений установлено на {time_str}")
+    
+    async def set_timezone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает часовой пояс"""
+        if not await self._check_auth(update, context):
+            return
+        
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажи часовой пояс, например:\n"
+                "/set_timezone Europe/Moscow\n"
+                "/set_timezone Asia/Yekaterinburg\n"
+                "/set_timezone Europe/London\n"
+                "/set_timezone UTC"
+            )
+            return
+        
+        timezone = context.args[0]
+        try:
+            pytz.timezone(timezone)
+        except pytz.exceptions.UnknownTimeZoneError:
+            await update.message.reply_text(
+                f"❌ Неизвестный часовой пояс '{timezone}'. \n"
+                "Попробуйте: Europe/Moscow, Europe/London, America/New_York, Asia/Yekaterinburg, UTC"
+            )
+            return
+        
+        self.db.update_user_settings(update.effective_user.id, timezone=timezone)
+        await update.message.reply_text(f"✅ Часовой пояс установлен: {timezone}")
+    
+    async def toggle_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Включает/выключает автоматическую мотивацию"""
+        if not await self._check_auth(update, context):
+            return
+        
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        
+        new_value = not settings['auto_motivation']
+        self.db.update_user_settings(user_id, auto_motivation=new_value)
+        
+        status = "включена" if new_value else "выключена"
+        await update.message.reply_text(f"✅ Автомотивация {status}")
+    
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обрабатывает нажатия на кнопки"""
+        # Специальная проверка для callback запросов
+        if not await self._check_auth_callback(update, context):
+            return
+        
+        query = update.callback_query
+        data = query.data
+        
+        if data == "motivate":
+            await self._send_motivation(query.message.chat_id, context, focus_work=False)
+        elif data == "motivate_work":
+            await self._send_motivation(query.message.chat_id, context, focus_work=True)
+        elif data == "stats":
+            # Создаем фейковый update для show_stats
+            class FakeUpdate:
+                def __init__(self, chat_id, message):
+                    self.effective_chat = type('obj', (object,), {'id': chat_id})
+                    self.message = message
+                    self.effective_user = type('obj', (object,), {'id': chat_id})
+            
+            fake_update = FakeUpdate(query.message.chat_id, query.message)
+            await self.show_stats(fake_update, context)
+        elif data == "change_period":
+            await self.change_period(update, context)
+        elif data.startswith("period_"):
+            await self.set_period(update, context)
+        elif data == "change_status_filter":
+            await self.status_filter_menu(update, context)
+        elif data.startswith("toggle_status_"):
+            await self.toggle_status(update, context)
+        elif data.startswith("status_"):
+            await self.set_all_statuses(update, context)
+        elif data == "reset_filters":
+            await self.reset_filters(update, context)
+        elif data == "notifications":
+            await self.notification_settings(update, context)
+        elif data == "toggle_daily":
+            await self.toggle_notification(update, context, "daily")
+        elif data == "toggle_overdue":
+            await self.toggle_notification(update, context, "overdue")
+        elif data == "toggle_work":
+            await self.toggle_notification(update, context, "work")
+        elif data == "back_to_settings":
+            await self.settings(update, context)
+        elif data == "back_to_tasks":
+            await self.show_tasks(update, context)
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает справку"""
+        if not await self._check_auth(update, context):
+            return
+        
+        help_text = """
+📚 Справка по командам:
+
+Основные команды:
+/tasks - показать все задачи (с фильтрами по дате и статусам)
+/work - показать только рабочие задачи
+/personal - показать только личные задачи
+/motivate - мотивация по всем задачам
+/motivate_work - мотивация только по рабочим
+/motivate_personal - мотивация только по личным
+/stats - статистика по задачам
+/filter - настроить фильтр по статусам
+/notifications - настроить уведомления
+/settings - все настройки
+
+Голосовые команды 🎤:
+Просто отправь голосовое сообщение с описанием задачи!
+Задача создаётся в файле journals/ГГГГ_ММ_ДД.md со статусом DOING
+
+Настройка:
+/setpath /путь/к/logseq - установить путь к Logseq
+/set_time ЧЧ:ММ - установить время уведомлений
+/set_timezone Europe/Moscow - установить часовой пояс
+/toggle_auto - вкл/выкл автоматические уведомления
+
+Уведомления:
+/toggle_daily - вкл/выкл ежедневную сводку
+/toggle_overdue - вкл/выкл уведомления о просроченных
+/toggle_work - вкл/выкл напоминания о рабочих задачах
+
+Фильтрация задач:
+• По дате: задачи из журналов за последние N месяцев
+• По статусам: можно выбрать какие статусы показывать
+• 💼 По типу: рабочие или личные (определяет ИИ)
+
+Статусы Logseq:
+📝 TODO - нужно сделать
+⚡ DOING - в процессе
+✅ DONE - выполнено
+🔥 NOW - делаю сейчас
+⏳ LATER - отложено
+⏸️ WAITING - ожидание
+❌ CANCELED - отменено
+        """
+        
+        await update.message.reply_text(help_text)
