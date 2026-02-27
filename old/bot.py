@@ -1,0 +1,1779 @@
+import os
+import re
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Set
+import sqlite3
+from dataclasses import dataclass, field
+import pytz
+import json
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    JobQueue
+)
+import aiohttp
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Task:
+    """Класс для хранения информации о задаче с поддержкой Logseq формата"""
+    id: str
+    content: str
+    deadline: Optional[datetime]
+    priority: str
+    file_path: str
+    line_number: int
+    completed: bool = False
+    scheduled: Optional[datetime] = None  # Запланированная дата
+    tags: List[str] = field(default_factory=list)  # Теги задачи
+    status: Optional[str] = None  # TODO, DOING, DONE, NOW, LATER, WAITING
+    parent_id: Optional[str] = None  # ID родительской задачи
+    created_date: Optional[datetime] = None  # Дата создания задачи
+    is_work: Optional[bool] = None  # Флаг, является ли задача рабочей
+
+class LogseqTaskParser:
+    """Парсер задач из файлов Logseq с поддержкой TODO формата и фильтрацией по дате"""
+    
+    # Все возможные статусы задач в Logseq
+    ALL_STATUSES = ['TODO', 'DOING', 'DONE', 'NOW', 'LATER', 'WAITING', 'CANCELED']
+    
+    def __init__(self, logseq_path: str, max_months: int = 3):
+        self.logseq_path = Path(logseq_path)
+        self.journals_path = self.logseq_path / "journals"
+        self.pages_path = self.logseq_path / "pages"
+        self.max_months = max_months  # Максимальный возраст задачи в месяцах (0 = без фильтра)
+        
+        # Маппинг статусов и эмодзи
+        self.status_emojis = {
+            'TODO': '📝',
+            'DOING': '⚡',
+            'DONE': '✅',
+            'NOW': '🔥',
+            'LATER': '⏳',
+            'WAITING': '⏸️',
+            'CANCELED': '❌'
+        }
+        
+    def parse_all_tasks(self, filter_by_date: bool = True, status_filter: Set[str] = None) -> List[Task]:
+        """
+        Парсит все задачи из всех файлов с опциональной фильтрацией по дате и статусам
+        
+        Args:
+            filter_by_date: применять ли фильтр по дате
+            status_filter: множество статусов для фильтрации (None = все статусы)
+        """
+        tasks = []
+        
+        # Проверяем существование пути
+        if not self.logseq_path.exists():
+            logger.error(f"Путь не существует: {self.logseq_path}")
+            return tasks
+        
+        # Парсим файлы журналов
+        if self.journals_path.exists():
+            for file_path in self.journals_path.glob("*.md"):
+                # Для файлов журналов применяем фильтр по дате из имени файла
+                if filter_by_date and self.max_months > 0 and not self._is_file_recent(file_path):
+                    logger.debug(f"Пропускаем старый файл журнала: {file_path.name}")
+                    continue
+                tasks.extend(self._parse_file(file_path))
+        
+        # Парсим страницы (всегда парсим, так как там могут быть важные задачи)
+        if self.pages_path.exists():
+            for file_path in self.pages_path.glob("*.md"):
+                tasks.extend(self._parse_file(file_path))
+        
+        # Парсим файлы в корне (всегда парсим)
+        for file_path in self.logseq_path.glob("*.md"):
+            if file_path.name not in ['README.md', 'index.md']:
+                tasks.extend(self._parse_file(file_path))
+        
+        # Если включена фильтрация, дополнительно фильтруем задачи по дате создания
+        if filter_by_date and self.max_months > 0:
+            tasks = self._filter_tasks_by_date(tasks)
+        
+        # Фильтруем по статусам, если указано
+        if status_filter is not None:
+            tasks = [t for t in tasks if t.status in status_filter]
+        
+        logger.info(f"Всего найдено задач после фильтрации: {len(tasks)}")
+        return tasks
+    
+    def _is_file_recent(self, file_path: Path) -> bool:
+        """Проверяет, является ли файл журнала достаточно свежим (по имени файла)"""
+        try:
+            # Имя файла журнала обычно в формате ГГГГ_ММ_ДД.md или ГГГГ-ММ-ДД.md
+            filename = file_path.stem  # без расширения
+            
+            # Пробуем разные форматы дат
+            date_formats = [
+                '%Y_%m_%d',  # 2024_01_15
+                '%Y-%m-%d',  # 2024-01-15
+                '%Y%m%d'     # 20240115
+            ]
+            
+            file_date = None
+            for date_format in date_formats:
+                try:
+                    file_date = datetime.strptime(filename, date_format)
+                    break
+                except ValueError:
+                    continue
+            
+            if file_date is None:
+                # Если не удалось распарсить дату из имени, используем дату модификации файла
+                file_date = datetime.fromtimestamp(file_path.stat().st_mtime)
+            
+            # Проверяем, не старше ли файл чем max_months
+            cutoff_date = datetime.now() - timedelta(days=30 * self.max_months)
+            return file_date > cutoff_date
+            
+        except Exception as e:
+            logger.error(f"Ошибка при проверке даты файла {file_path}: {e}")
+            # В случае ошибки включаем файл
+            return True
+    
+    def _filter_tasks_by_date(self, tasks: List[Task]) -> List[Task]:
+        """Фильтрует задачи по дате создания"""
+        cutoff_date = datetime.now() - timedelta(days=30 * self.max_months)
+        filtered_tasks = []
+        
+        for task in tasks:
+            # Для задач из журналов проверяем дату из имени файла
+            if 'journals' in task.file_path:
+                if task.created_date and task.created_date > cutoff_date:
+                    filtered_tasks.append(task)
+                elif task.deadline and task.deadline > cutoff_date:
+                    # Если есть дедлайн в будущем, оставляем задачу
+                    filtered_tasks.append(task)
+            else:
+                # Задачи из pages всегда включаем
+                filtered_tasks.append(task)
+        
+        return filtered_tasks
+    
+    def _parse_file(self, file_path: Path) -> List[Task]:
+        """Парсит один файл с поддержкой вложенных задач"""
+        tasks = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            # Отслеживаем уровень вложенности
+            task_stack = []  # (task, indent_level)
+            
+            for i, line in enumerate(lines):
+                # Определяем уровень отступа (количество пробелов в начале)
+                raw_line = line
+                indent_level = len(raw_line) - len(raw_line.lstrip())
+                
+                # Ищем задачи в формате Logseq
+                task = self._parse_line(line, file_path, i + 1)
+                
+                if task:
+                    # Если есть стек задач, устанавливаем родителя
+                    while task_stack and task_stack[-1][1] >= indent_level:
+                        task_stack.pop()
+                    
+                    if task_stack:
+                        task.parent_id = task_stack[-1][0].id
+                    
+                    tasks.append(task)
+                    task_stack.append((task, indent_level))
+                    
+        except Exception as e:
+            logger.error(f"Ошибка при парсинге файла {file_path}: {e}")
+            
+        return tasks
+    
+    def _parse_line(self, line: str, file_path: Path, line_number: int) -> Optional[Task]:
+        """Парсит одну строку и извлекает задачу в формате Logseq"""
+        
+        # Сохраняем оригинальную строку
+        original_line = line
+        line = line.strip()
+        
+        # Пропускаем пустые строки и заголовки
+        if not line or line.startswith('#'):
+            return None
+        
+        # Ищем задачи с маркерами
+        status = None
+        content = None
+        completed = False
+        
+        # Паттерны для разных форматов Logseq
+        patterns = [
+            # TODO/DOING/DONE формат (основной)
+            (r'^[-*]\s*(TODO|DOING|DONE|LATER|NOW|WAITING|CANCELED)\s+(.*)', True),
+            # Формат с квадратными скобками
+            (r'^[-*]\s*\[( |x|X|\.|>|✔|❌|✅|⬜)\]\s*(.*)', True),
+            # Формат с приоритетом в скобках
+            (r'^[-*]\s*(TODO|DOING|DONE)\s+\[([A-C])\]\s+(.*)', True),
+            # Формат с эмодзи
+            (r'^[-*]\s*(✔|❌|▶|⏸|✅|⬜|🔴|🟡|🟢)\s+(.*)', True),
+            # Формат без маркера, но с тегами (может быть задачей)
+            (r'^[-*]\s+([^#].*?)(?:\s+#\w+)*$', False)
+        ]
+        
+        for pattern, has_status in patterns:
+            match = re.search(pattern, line)
+            if match:
+                if has_status:
+                    if len(match.groups()) == 2:
+                        status = match.group(1)
+                        content = match.group(2)
+                    elif len(match.groups()) == 3:
+                        status = match.group(1)
+                        content = match.group(3)
+                else:
+                    content = match.group(1)
+                break
+        
+        # Если не нашли задачу по паттернам, проверяем наличие тегов
+        if not content:
+            if re.search(r'#\w+', line) and line.startswith(('-', '*')):
+                content = line.lstrip('-* ').strip()
+            else:
+                return None
+        
+        # Нормализуем статус (приводим к верхнему регистру для стандартных статусов)
+        if status:
+            status_upper = status.upper()
+            if status_upper in self.ALL_STATUSES:
+                status = status_upper
+        
+        # Определяем выполненность задачи
+        if status:
+            if status in ['DONE', 'CANCELED'] or status in ['✔', '✅', '❌']:
+                completed = True
+            elif status in ['TODO', 'LATER', 'WAITING'] or status in ['⬜']:
+                completed = False
+            elif status in ['DOING', 'NOW'] or status in ['▶']:
+                completed = False  # В процессе - не выполнено
+        else:
+            # Если нет статуса, считаем невыполненной
+            completed = False
+        
+        # Извлекаем дедлайн из разных форматов
+        deadline = self._extract_deadline(original_line)
+        
+        # Извлекаем приоритет
+        priority = self._extract_priority(original_line, status)
+        
+        # Извлекаем запланированную дату
+        scheduled = self._extract_scheduled(original_line)
+        
+        # Извлекаем теги
+        tags = self._extract_tags(original_line)
+        
+        # Извлекаем дату создания задачи (для журналов)
+        created_date = self._extract_created_date(file_path, line_number)
+        
+        # Создаем ID задачи
+        task_id = f"{file_path.stem}_{line_number}"
+        
+        # Очищаем контент от лишних пробелов
+        content = content.strip()
+        
+        return Task(
+            id=task_id,
+            content=content,
+            deadline=deadline,
+            priority=priority,
+            file_path=str(file_path),
+            line_number=line_number,
+            completed=completed,
+            scheduled=scheduled,
+            tags=tags,
+            status=status,
+            parent_id=None,  # Будет установлен в _parse_file
+            created_date=created_date,
+            is_work=None  # Будет определено позже через Ollama
+        )
+    
+    def _extract_created_date(self, file_path: Path, line_number: int) -> Optional[datetime]:
+        """Извлекает дату создания задачи из имени файла журнала"""
+        if 'journals' in str(file_path):
+            try:
+                filename = file_path.stem
+                date_formats = ['%Y_%m_%d', '%Y-%m-%d', '%Y%m%d']
+                
+                for date_format in date_formats:
+                    try:
+                        return datetime.strptime(filename, date_format)
+                    except ValueError:
+                        continue
+            except Exception:
+                pass
+        
+        # Для страниц используем дату модификации файла
+        try:
+            return datetime.fromtimestamp(file_path.stat().st_mtime)
+        except Exception:
+            return None
+    
+    def _extract_deadline(self, line: str) -> Optional[datetime]:
+        """Извлекает дедлайн из разных форматов"""
+        deadline = None
+        
+        # Формат DEADLINE: <2024-12-31>
+        deadline_match = re.search(r'DEADLINE:\s*<(\d{4}-\d{2}-\d{2})', line, re.IGNORECASE)
+        if deadline_match:
+            try:
+                deadline = datetime.strptime(deadline_match.group(1), '%Y-%m-%d')
+                return deadline
+            except ValueError:
+                pass
+        
+        # Формат deadline:: 2024-12-31
+        deadline_match = re.search(r'deadline::\s*(\d{4}-\d{2}-\d{2})', line, re.IGNORECASE)
+        if deadline_match:
+            try:
+                deadline = datetime.strptime(deadline_match.group(1), '%Y-%m-%d')
+                return deadline
+            except ValueError:
+                pass
+        
+        # Формат due: 2024-12-31
+        deadline_match = re.search(r'due:\s*(\d{4}-\d{2}-\d{2})', line, re.IGNORECASE)
+        if deadline_match:
+            try:
+                deadline = datetime.strptime(deadline_match.group(1), '%Y-%m-%d')
+                return deadline
+            except ValueError:
+                pass
+        
+        return None
+    
+    def _extract_scheduled(self, line: str) -> Optional[datetime]:
+        """Извлекает запланированную дату"""
+        scheduled = None
+        
+        # Формат SCHEDULED: <2024-12-20>
+        scheduled_match = re.search(r'SCHEDULED:\s*<(\d{4}-\d{2}-\d{2})', line, re.IGNORECASE)
+        if scheduled_match:
+            try:
+                scheduled = datetime.strptime(scheduled_match.group(1), '%Y-%m-%d')
+            except ValueError:
+                pass
+        
+        # Формат scheduled:: 2024-12-20
+        scheduled_match = re.search(r'scheduled::\s*(\d{4}-\d{2}-\d{2})', line, re.IGNORECASE)
+        if scheduled_match:
+            try:
+                scheduled = datetime.strptime(scheduled_match.group(1), '%Y-%m-%d')
+            except ValueError:
+                pass
+        
+        return scheduled
+    
+    def _extract_priority(self, line: str, status: Optional[str]) -> str:
+        """Извлекает приоритет задачи"""
+        
+        # Приоритет в квадратных скобках [A]
+        priority_match = re.search(r'\[([A-Ca-c])\]', line)
+        if priority_match:
+            priority_map = {'A': 'высокий', 'B': 'средний', 'C': 'обычный',
+                           'a': 'высокий', 'b': 'средний', 'c': 'обычный'}
+            return priority_map.get(priority_match.group(1), 'обычный')
+        
+        # Приоритет PRIORITY: высокий
+        priority_match = re.search(r'PRIORITY:\s*(\w+)', line, re.IGNORECASE)
+        if priority_match:
+            priority = priority_match.group(1).lower()
+            if priority in ['высокий', 'средний', 'обычный', 'high', 'medium', 'low']:
+                priority_map = {'high': 'высокий', 'medium': 'средний', 'low': 'обычный'}
+                return priority_map.get(priority, priority)
+        
+        # Приоритет priority:: A
+        priority_match = re.search(r'priority::\s*([A-Ca-c])', line, re.IGNORECASE)
+        if priority_match:
+            priority_map = {'A': 'высокий', 'B': 'средний', 'C': 'обычный',
+                           'a': 'высокий', 'b': 'средний', 'c': 'обычный'}
+            return priority_map.get(priority_match.group(1), 'обычный')
+        
+        # По умолчанию
+        return 'обычный'
+    
+    def _extract_tags(self, line: str) -> List[str]:
+        """Извлекает теги из строки"""
+        tags = []
+        
+        # Теги в формате #тег
+        tag_matches = re.findall(r'#(\w+)', line)
+        tags.extend(tag_matches)
+        
+        # Теги в формате :тег:
+        tag_matches = re.findall(r':(\w+):', line)
+        tags.extend(tag_matches)
+        
+        return tags
+
+class WorkTaskClassifier:
+    """Классификатор рабочих задач с использованием Ollama"""
+    
+    def __init__(self, base_url: str = "http://localhost:11434", model: str = "llama2",
+                 work_keywords: List[str] = None, work_tags: List[str] = None,
+                 personal_keywords: List[str] = None):
+        self.base_url = base_url
+        self.model = model
+        self.work_keywords = work_keywords or [
+            "работа", "work", "job", "проект", "project", "task", "задача",
+            "дедлайн", "deadline", "отчет", "report", "клиент", "client",
+            "встреча", "meeting", "презентация", "presentation", "код", "code",
+            "разработка", "development", "баг", "bug", "фича", "feature",
+            "документация", "documentation"
+        ]
+        self.work_tags = work_tags or ["работа", "work", "job", "проект", "клиент", "рабочее"]
+        self.personal_keywords = personal_keywords or [
+            "личное", "personal", "дом", "home", "семья", "family",
+            "отдых", "rest", "хобби", "hobby", "спорт", "sport"
+        ]
+        
+        # Кэш для результатов классификации
+        self.classification_cache = {}
+        
+    async def is_work_task(self, task: Task) -> bool:
+        """
+        Определяет, является ли задача рабочей, используя Ollama
+        """
+        # Проверяем кэш
+        cache_key = task.id
+        if cache_key in self.classification_cache:
+            return self.classification_cache[cache_key]
+        
+        # Быстрая проверка по ключевым словам и тегам
+        quick_result = self._quick_classify(task)
+        if quick_result is not None:
+            self.classification_cache[cache_key] = quick_result
+            return quick_result
+        
+        # Если быстрая проверка не дала результата, используем Ollama
+        result = await self._ollama_classify(task)
+        self.classification_cache[cache_key] = result
+        return result
+    
+    def _quick_classify(self, task: Task) -> Optional[bool]:
+        """
+        Быстрая классификация по ключевым словам и тегам
+        Возвращает None если не удалось определить
+        """
+        content_lower = task.content.lower()
+        
+        # Проверка по тегам
+        for tag in task.tags:
+            if tag in self.work_tags:
+                return True
+            if tag in ["личное", "personal", "дом", "home"]:
+                return False
+        
+        # Проверка по ключевым словам
+        work_match = any(keyword in content_lower for keyword in self.work_keywords)
+        personal_match = any(keyword in content_lower for keyword in self.personal_keywords)
+        
+        if work_match and not personal_match:
+            return True
+        if personal_match and not work_match:
+            return False
+        
+        return None  # Не удалось определить
+    
+    async def _ollama_classify(self, task: Task) -> bool:
+        """
+        Использует Ollama для классификации задачи
+        """
+        prompt = f"""Ты - помощник, который определяет, относится ли задача к работе или к личным делам.
+
+Задача: {task.content}
+Контекст: {'Дедлайн: ' + task.deadline.strftime('%Y-%m-%d') if task.deadline else 'Без дедлайна'}
+Теги: {', '.join(task.tags) if task.tags else 'Нет тегов'}
+
+Ответь только "work" если задача рабочая, или "personal" если личная.
+Не пиши ничего кроме одного слова.
+"""
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,  # Низкая температура для точности
+                        "max_tokens": 10
+                    }
+                }
+                
+                async with session.post(f"{self.base_url}/api/generate", json=payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        answer = result.get("response", "").strip().lower()
+                        
+                        if "work" in answer:
+                            return True
+                        elif "personal" in answer:
+                            return False
+                        else:
+                            # Если ответ не распознан, используем эвристику
+                            return self._heuristic_classify(task)
+                    else:
+                        logger.error(f"Ошибка Ollama: {response.status}")
+                        return self._heuristic_classify(task)
+                        
+        except Exception as e:
+            logger.error(f"Ошибка при обращении к Ollama: {e}")
+            return self._heuristic_classify(task)
+    
+    def _heuristic_classify(self, task: Task) -> bool:
+        """
+        Эвристическая классификация на случай недоступности Ollama
+        """
+        content_lower = task.content.lower()
+        
+        # Подсчитываем количество рабочих и личных ключевых слов
+        work_count = sum(1 for kw in self.work_keywords if kw in content_lower)
+        personal_count = sum(1 for kw in self.personal_keywords if kw in content_lower)
+        
+        # Учитываем теги
+        for tag in task.tags:
+            if tag in self.work_tags:
+                work_count += 2
+            if tag in ["личное", "personal"]:
+                personal_count += 2
+        
+        # Если есть дедлайн, это может указывать на рабочую задачу
+        if task.deadline:
+            work_count += 1
+        
+        return work_count > personal_count
+
+class MotivationGenerator:
+    """Генератор мотивационных сообщений через Ollama"""
+    
+    def __init__(self, base_url: str = "http://localhost:11434", model: str = "llama2"):
+        self.base_url = base_url
+        self.model = model
+        
+    async def generate_motivation(self, tasks: List[Task], focus_work: bool = False) -> str:
+        """
+        Генерирует мотивационное сообщение на основе списка задач
+        
+        Args:
+            tasks: список задач
+            focus_work: фокусироваться ли на рабочих задачах
+        """
+        if not tasks:
+            return "У тебя нет невыполненных задач! Отличная работа! 🎉"
+        
+        # Фильтруем задачи если нужен фокус на работе
+        if focus_work:
+            work_tasks = [t for t in tasks if t.is_work]
+            personal_tasks = [t for t in tasks if t.is_work is False]
+            
+            if not work_tasks:
+                return "У тебя нет рабочих задач! Можешь отдохнуть или заняться личными делами. 🌟"
+            
+            tasks_to_show = work_tasks
+            focus_text = "РАБОЧИЕ задачи"
+        else:
+            tasks_to_show = tasks
+            focus_text = "ВСЕ задачи"
+        
+        # Формируем промпт
+        tasks_desc = []
+        now = datetime.now()
+        
+        for task in tasks_to_show[:10]:  # Ограничиваем до 10 задач для промпта
+            deadline_info = ""
+            if task.deadline:
+                days_left = (task.deadline - now).days
+                if days_left < 0:
+                    deadline_info = f"(просрочено на {abs(days_left)} дней)"
+                elif days_left == 0:
+                    deadline_info = "(сегодня дедлайн)"
+                else:
+                    deadline_info = f"(осталось {days_left} дней)"
+            
+            status_emoji = self._get_status_emoji(task.status)
+            priority_emoji = "🔴" if task.priority == "высокий" else "🟡" if task.priority == "средний" else "🟢"
+            work_marker = "💼 " if task.is_work else "🏠 "
+            
+            task_line = f"{work_marker}{status_emoji}{priority_emoji} {task.content} {deadline_info}"
+            if task.tags:
+                task_line += f" #{' #'.join(task.tags)}"
+            
+            tasks_desc.append(task_line)
+        
+        # Статистика по задачам
+        work_count = len([t for t in tasks_to_show if t.is_work])
+        personal_count = len([t for t in tasks_to_show if t.is_work is False])
+        overdue_count = len([t for t in tasks_to_show if t.deadline and t.deadline < now])
+        
+        prompt = f"""Ты - мотивационный тренер. У пользователя есть список {focus_text}:
+
+{chr(10).join(tasks_desc)}
+
+Статистика:
+• Всего задач: {len(tasks_to_show)}
+• Рабочих: {work_count}
+• Личных: {personal_count}
+• Просрочено: {overdue_count}
+
+Напиши короткое (не более 500 символов) мотивирующее сообщение, которое подтолкнет его к выполнению этих задач.
+Учти соотношение рабочих и личных задач, просрочки и срочность.
+Будь дружелюбным, используй эмодзи. Если фокус на работе - делай акцент на карьерных целях.
+"""
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.7,
+                        "max_tokens": 500
+                    }
+                }
+                
+                async with session.post(f"{self.base_url}/api/generate", json=payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result.get("response", "Давай, ты сможешь! 💪").strip()
+                    else:
+                        logger.error(f"Ошибка Ollama: {response.status}")
+                        return self._get_fallback_message(tasks_to_show, focus_work)
+                        
+        except Exception as e:
+            logger.error(f"Ошибка при обращении к Ollama: {e}")
+            return self._get_fallback_message(tasks_to_show, focus_work)
+    
+    def _get_status_emoji(self, status: Optional[str]) -> str:
+        """Возвращает эмодзи для статуса задачи"""
+        emoji_map = {
+            'TODO': '📝',
+            'DOING': '⚡',
+            'DONE': '✅',
+            'NOW': '🔥',
+            'LATER': '⏳',
+            'WAITING': '⏸️',
+            'CANCELED': '❌'
+        }
+        return emoji_map.get(status, '📌')
+    
+    def _get_fallback_message(self, tasks: List[Task], focus_work: bool) -> str:
+        """Возвращает запасное сообщение если Ollama недоступна"""
+        now = datetime.now()
+        overdue = [t for t in tasks if t.deadline and t.deadline < now]
+        doing = [t for t in tasks if t.status in ['DOING', 'NOW']]
+        work_tasks = [t for t in tasks if t.is_work]
+        
+        if focus_work:
+            if overdue:
+                return f"💼 У тебя {len(overdue)} просроченных рабочих задач! Самое время ими заняться."
+            elif work_tasks:
+                return f"💼 У тебя {len(work_tasks)} рабочих задач. Сосредоточься на карьере!"
+            else:
+                return "💼 Рабочих задач нет. Отличное время для отдыха!"
+        else:
+            if overdue:
+                return f"⚠️ У тебя {len(overdue)} просроченных задач! Самое время их выполнить."
+            elif doing:
+                return f"⚡ Продолжай работу над {len(doing)} задачами в процессе."
+            else:
+                return f"📋 У тебя {len(tasks)} невыполненных задач."
+
+class TaskDatabase:
+    """База данных для отслеживания отправленных задач и настроек"""
+    
+    def __init__(self, db_path: str = "tasks.db", default_status_filter: List[str] = None):
+        self.db_path = db_path
+        self.default_status_filter = default_status_filter or ['TODO', 'DOING', 'NOW', 'LATER']
+        self._init_db()
+        self._migrate_db()
+    
+    def _init_db(self):
+        """Инициализирует базу данных"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sent_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    sent_date TIMESTAMP,
+                    user_id INTEGER
+                )
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id INTEGER PRIMARY KEY,
+                    notify_time TEXT,
+                    timezone TEXT,
+                    auto_motivation BOOLEAN DEFAULT 1
+                )
+            """)
+    
+    def _migrate_db(self):
+        """Обновляет структуру базы данных если нужно"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Проверяем есть ли колонка status_filter
+                cursor = conn.execute("PRAGMA table_info(user_settings)")
+                columns = [column[1] for column in cursor.fetchall()]
+                
+                # Если нет колонки status_filter, добавляем её
+                if 'status_filter' not in columns:
+                    default_filter_str = ','.join(self.default_status_filter)
+                    conn.execute(f"ALTER TABLE user_settings ADD COLUMN status_filter TEXT DEFAULT '{default_filter_str}'")
+                    logger.info("✅ Добавлена колонка status_filter в базу данных")
+                    
+        except Exception as e:
+            logger.error(f"⚠️ Ошибка при миграции базы данных: {e}")
+    
+    def mark_task_sent(self, task_id: str, user_id: int):
+        """Отмечает задачу как отправленную"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sent_tasks (task_id, sent_date, user_id) VALUES (?, ?, ?)",
+                (task_id, datetime.now(), user_id)
+            )
+    
+    def get_sent_tasks(self, user_id: int, hours: int = 24) -> List[str]:
+        """Получает список отправленных задач за последние N часов"""
+        cutoff = datetime.now() - timedelta(hours=hours)
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT task_id FROM sent_tasks WHERE user_id = ? AND sent_date > ?",
+                (user_id, cutoff)
+            )
+            return [row[0] for row in cursor.fetchall()]
+    
+    def get_user_settings(self, user_id: int) -> Dict:
+        """Получает настройки пользователя"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Проверяем есть ли колонка status_filter
+                cursor = conn.execute("PRAGMA table_info(user_settings)")
+                columns = [column[1] for column in cursor.fetchall()]
+                
+                if 'status_filter' in columns:
+                    cursor = conn.execute(
+                        "SELECT notify_time, timezone, auto_motivation, status_filter FROM user_settings WHERE user_id = ?",
+                        (user_id,)
+                    )
+                else:
+                    cursor = conn.execute(
+                        "SELECT notify_time, timezone, auto_motivation FROM user_settings WHERE user_id = ?",
+                        (user_id,)
+                    )
+                
+                row = cursor.fetchone()
+                if row:
+                    if len(row) == 4:  # Есть status_filter
+                        return {
+                            "notify_time": row[0],
+                            "timezone": row[1],
+                            "auto_motivation": bool(row[2]),
+                            "status_filter": row[3].split(',') if row[3] else self.default_status_filter.copy()
+                        }
+                    else:  # Нет status_filter
+                        return {
+                            "notify_time": row[0],
+                            "timezone": row[1],
+                            "auto_motivation": bool(row[2]),
+                            "status_filter": self.default_status_filter.copy()
+                        }
+        except Exception as e:
+            logger.error(f"Ошибка при получении настроек: {e}")
+        
+        # Значения по умолчанию
+        return {
+            "notify_time": "09:00",
+            "timezone": "Europe/Moscow",
+            "auto_motivation": True,
+            "status_filter": self.default_status_filter.copy()
+        }
+    
+    def update_user_settings(self, user_id: int, **kwargs):
+        """Обновляет настройки пользователя"""
+        settings = self.get_user_settings(user_id)
+        settings.update(kwargs)
+        
+        # Преобразуем список статусов в строку для хранения
+        status_filter_str = ','.join(settings["status_filter"])
+        
+        with sqlite3.connect(self.db_path) as conn:
+            # Проверяем есть ли колонка status_filter
+            cursor = conn.execute("PRAGMA table_info(user_settings)")
+            columns = [column[1] for column in cursor.fetchall()]
+            
+            if 'status_filter' in columns:
+                conn.execute(
+                    """INSERT OR REPLACE INTO user_settings 
+                       (user_id, notify_time, timezone, auto_motivation, status_filter) 
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (user_id, settings["notify_time"], settings["timezone"], 
+                     settings["auto_motivation"], status_filter_str)
+                )
+            else:
+                conn.execute(
+                    """INSERT OR REPLACE INTO user_settings 
+                       (user_id, notify_time, timezone, auto_motivation) 
+                       VALUES (?, ?, ?, ?)""",
+                    (user_id, settings["notify_time"], settings["timezone"], 
+                     settings["auto_motivation"])
+                )
+
+class LogseqBot:
+    """Основной класс бота"""
+    
+    # Доступные статусы для фильтрации
+    AVAILABLE_STATUSES = ['TODO', 'DOING', 'DONE', 'NOW', 'LATER', 'WAITING', 'CANCELED']
+    
+    def __init__(self, token: str, logseq_path: str, ollama_url: str = "http://localhost:11434", 
+                 ollama_model: str = "llama2", max_months: int = 3, default_status_filter: List[str] = None,
+                 work_keywords: List[str] = None, work_tags: List[str] = None,
+                 personal_keywords: List[str] = None):
+        self.token = token
+        self.logseq_path = logseq_path
+        self.parser = LogseqTaskParser(logseq_path, max_months)
+        self.classifier = WorkTaskClassifier(
+            base_url=ollama_url,
+            model=ollama_model,
+            work_keywords=work_keywords,
+            work_tags=work_tags,
+            personal_keywords=personal_keywords
+        )
+        self.motivator = MotivationGenerator(base_url=ollama_url, model=ollama_model)
+        self.db = TaskDatabase(default_status_filter=default_status_filter)
+        
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /start"""
+        welcome_text = """
+👋 Привет! Я бот для мотивации выполнения задач из Logseq.
+
+Я анализирую твои задачи в формате Logseq и помогаю с мотивацией.
+Особенность: я умею отличать рабочие задачи от личных!
+
+**Поддерживаемые форматы задач:**
+• TODO / DOING / DONE / LATER / NOW / WAITING
+• [ ] / [x] / [>] / [.]
+• Приоритеты [A], [B], [C]
+• Дедлайны DEADLINE: <2024-12-31>
+• Теги #важно :работа:
+
+**Фильтрация задач:**
+• По дате: задачи из журналов за последние 3 месяца
+• По статусам: можно выбрать какие статусы показывать
+• 💼 По типу: рабочие или личные (определяет ИИ)
+
+**Команды:**
+/tasks - показать все задачи
+/work - показать только рабочие задачи
+/personal - показать только личные задачи
+/motivate - получить мотивацию по всем задачам
+/motivate_work - мотивация только по рабочим задачам
+/motivate_personal - мотивация только по личным задачам
+/stats - статистика по задачам
+/filter - настроить фильтр по статусам
+/settings - настройки уведомлений
+/help - помощь
+
+**Для начала работы:**
+1. Укажи путь к твоей базе Logseq: /setpath /путь/к/logseq
+2. Настрой время уведомлений: /set_time 09:00
+3. Укажи часовой пояс: /set_timezone Europe/Moscow
+        """
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    
+    async def set_path(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает путь к Logseq"""
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажи путь к папке Logseq, например:\n"
+                "/setpath /home/user/logseq\n"
+                "/setpath /home/user/Documents/logseq\n"
+                "/setpath /home/user/Logseq"
+            )
+            return
+        
+        path = ' '.join(context.args)
+        
+        # Проверяем существование пути
+        if not os.path.exists(path):
+            await update.message.reply_text(f"❌ Путь не существует: {path}")
+            return
+        
+        # Проверяем наличие папок journals или pages
+        journals_path = os.path.join(path, "journals")
+        pages_path = os.path.join(path, "pages")
+        
+        if not os.path.exists(journals_path) and not os.path.exists(pages_path):
+            await update.message.reply_text(
+                f"❌ В папке {path} не найдены подпапки 'journals' или 'pages'.\n"
+                "Убедись, что это правильная папка Logseq."
+            )
+            return
+        
+        context.user_data['logseq_path'] = path
+        self.parser = LogseqTaskParser(path, self.parser.max_months)
+        
+        # Проверяем, есть ли задачи
+        tasks = self.parser.parse_all_tasks()
+        await update.message.reply_text(
+            f"✅ Путь установлен: {path}\n"
+            f"Найдено задач за последние {self.parser.max_months} месяцев: {len(tasks)}"
+        )
+    
+    def _get_task_age_info(self, task: Task) -> str:
+        """Возвращает информацию о возрасте задачи"""
+        if task.created_date:
+            days_old = (datetime.now() - task.created_date).days
+            if days_old > 0:
+                if days_old < 30:
+                    return f"_(создано {days_old} дн. назад)_"
+                elif days_old < 90:
+                    months = days_old // 30
+                    return f"_(создано {months} мес. назад)_"
+        return ""
+    
+    def _get_status_emoji(self, status: Optional[str]) -> str:
+        """Возвращает эмодзи для статуса задачи"""
+        emoji_map = {
+            'TODO': '📝',
+            'DOING': '⚡',
+            'DONE': '✅',
+            'NOW': '🔥',
+            'LATER': '⏳',
+            'WAITING': '⏸️',
+            'CANCELED': '❌'
+        }
+        return emoji_map.get(status, '📌')
+    
+    async def _classify_tasks(self, tasks: List[Task]) -> List[Task]:
+        """Классифицирует задачи на рабочие/личные"""
+        classified_tasks = []
+        for task in tasks:
+            if task.is_work is None:  # Если еще не классифицировано
+                task.is_work = await self.classifier.is_work_task(task)
+            classified_tasks.append(task)
+        return classified_tasks
+    
+    async def show_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE, task_type: str = "all"):
+        """
+        Показывает задачи с учетом фильтров
+        
+        Args:
+            task_type: "all", "work", или "personal"
+        """
+        try:
+            user_id = update.effective_user.id
+            settings = self.db.get_user_settings(user_id)
+            status_filter = set(settings["status_filter"])
+            
+            # Получаем и классифицируем задачи
+            all_tasks = self.parser.parse_all_tasks(filter_by_date=True, status_filter=status_filter)
+            all_tasks = await self._classify_tasks(all_tasks)
+            
+            if not all_tasks:
+                await update.message.reply_text(
+                    "❌ Не найдено задач.\n"
+                    "Проверь:\n"
+                    "1. Правильный ли путь к Logseq (/setpath)\n"
+                    "2. Есть ли задачи в файлах"
+                )
+                return
+            
+            # Фильтруем по типу задач
+            if task_type == "work":
+                filtered_tasks = [t for t in all_tasks if t.is_work]
+                type_emoji = "💼"
+                type_text = "РАБОЧИЕ"
+            elif task_type == "personal":
+                filtered_tasks = [t for t in all_tasks if t.is_work is False]
+                type_emoji = "🏠"
+                type_text = "ЛИЧНЫЕ"
+            else:
+                filtered_tasks = all_tasks
+                type_emoji = "📋"
+                type_text = "ВСЕ"
+            
+            if not filtered_tasks:
+                await update.message.reply_text(
+                    f"{type_emoji} Нет {type_text.lower()} задач по текущему фильтру.\n"
+                    f"Попробуй другой тип задач или измени фильтр статусов (/filter)."
+                )
+                return
+            
+            # Фильтруем задачи: не выполнены (DONE показываем отдельно)
+            incomplete_tasks = [t for t in filtered_tasks if not t.completed]
+            completed_tasks = [t for t in filtered_tasks if t.completed]
+            
+            # Группируем по статусам и срочности
+            now = datetime.now()
+            
+            # Группировка по статусам
+            tasks_by_status = {}
+            for status in self.AVAILABLE_STATUSES:
+                if status in status_filter:
+                    tasks_by_status[status] = [t for t in incomplete_tasks if t.status == status]
+            
+            # Просроченные (отдельная группа)
+            overdue = [t for t in incomplete_tasks if t.deadline and t.deadline < now]
+            
+            # На сегодня
+            today = [t for t in incomplete_tasks if t.deadline and t.deadline.date() == now.date()]
+            
+            # Формируем сообщение
+            period_text = f"за последние {self.parser.max_months} месяцев" if self.parser.max_months > 0 else "за всё время"
+            status_text = ', '.join([f"{self._get_status_emoji(s)} {s}" for s in status_filter if s in tasks_by_status])
+            
+            message = f"{type_emoji} **{type_text} ЗАДАЧИ {period_text}**\n"
+            message += f"🎯 **Фильтр статусов:** {status_text}\n"
+            message += f"📊 **Всего:** {len(incomplete_tasks)} активных, {len(completed_tasks)} выполненных\n\n"
+            
+            # Статистика по рабочим/личным
+            work_count = len([t for t in incomplete_tasks if t.is_work])
+            personal_count = len([t for t in incomplete_tasks if t.is_work is False])
+            message += f"💼 Рабочих: {work_count} | 🏠 Личных: {personal_count}\n\n"
+            
+            # Показываем просроченные
+            if overdue:
+                message += "🔴 **Просроченные:**\n"
+                for task in overdue[:5]:
+                    days = (now - task.deadline).days
+                    status_emoji = self._get_status_emoji(task.status)
+                    work_marker = "💼 " if task.is_work else "🏠 "
+                    age_info = self._get_task_age_info(task)
+                    message += f"• {work_marker}{status_emoji} {task.content} (просрочено {days} дн.) {age_info}\n"
+                if len(overdue) > 5:
+                    message += f"  ...и еще {len(overdue) - 5}\n"
+                message += "\n"
+            
+            # Показываем задачи на сегодня
+            if today:
+                message += "🔥 **На сегодня:**\n"
+                for task in today[:5]:
+                    status_emoji = self._get_status_emoji(task.status)
+                    work_marker = "💼 " if task.is_work else "🏠 "
+                    age_info = self._get_task_age_info(task)
+                    message += f"• {work_marker}{status_emoji} {task.content} {age_info}\n"
+                if len(today) > 5:
+                    message += f"  ...и еще {len(today) - 5}\n"
+                message += "\n"
+            
+            # Показываем задачи по статусам
+            for status in ['NOW', 'DOING', 'TODO', 'LATER', 'WAITING']:
+                if status in tasks_by_status and tasks_by_status[status]:
+                    status_emoji = self._get_status_emoji(status)
+                    status_name = {
+                        'NOW': 'Сейчас',
+                        'DOING': 'В процессе',
+                        'TODO': 'К выполнению',
+                        'LATER': 'Отложенные',
+                        'WAITING': 'Ожидание'
+                    }.get(status, status)
+                    
+                    message += f"{status_emoji} **{status_name}:**\n"
+                    for task in tasks_by_status[status][:5]:
+                        work_marker = "💼 " if task.is_work else "🏠 "
+                        age_info = self._get_task_age_info(task)
+                        deadline_info = ""
+                        if task.deadline:
+                            days_left = (task.deadline - now).days
+                            if days_left >= 0:
+                                deadline_info = f" (дедлайн через {days_left} дн.)"
+                        message += f"• {work_marker}{task.content}{deadline_info} {age_info}\n"
+                        if task.tags:
+                            message += f"  `{' '.join(['#'+t for t in task.tags])}`\n"
+                    if len(tasks_by_status[status]) > 5:
+                        message += f"  ...и еще {len(tasks_by_status[status]) - 5}\n"
+                    message += "\n"
+            
+            # Показываем выполненные (если есть в фильтре)
+            if 'DONE' in status_filter and completed_tasks:
+                message += "✅ **Недавно выполненные:**\n"
+                for task in completed_tasks[:5]:
+                    work_marker = "💼 " if task.is_work else "🏠 "
+                    age_info = self._get_task_age_info(task)
+                    message += f"• {work_marker}{task.content} {age_info}\n"
+                if len(completed_tasks) > 5:
+                    message += f"  ...и еще {len(completed_tasks) - 5}\n"
+                message += "\n"
+            
+            # Добавляем информацию о фильтрах
+            message += f"---\n"
+            message += f"_Фильтр по дате: {self.parser.max_months if self.parser.max_months > 0 else 'все'} мес._\n"
+            message += f"_Фильтр по статусам: {len(status_filter)} статусов_"
+            
+            # Добавляем кнопки
+            keyboard = [
+                [InlineKeyboardButton("🎯 Мотивация (все)", callback_data="motivate"),
+                 InlineKeyboardButton("💼 Мотивация (работа)", callback_data="motivate_work")],
+                [InlineKeyboardButton("📊 Статистика", callback_data="stats"),
+                 InlineKeyboardButton("🎯 Статусы", callback_data="change_status_filter")],
+                [InlineKeyboardButton("⏰ Период", callback_data="change_period"),
+                 InlineKeyboardButton("🔄 Сбросить", callback_data="reset_filters")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Разбиваем длинное сообщение
+            if len(message) > 4000:
+                parts = [message[i:i+4000] for i in range(0, len(message), 4000)]
+                for part in parts:
+                    await update.message.reply_text(part, parse_mode='Markdown')
+                await update.message.reply_text("Выбери действие:", reply_markup=reply_markup)
+            else:
+                await update.message.reply_text(message, parse_mode='Markdown', reply_markup=reply_markup)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при показе задач: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+    
+    async def show_work_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает только рабочие задачи"""
+        await self.show_tasks(update, context, task_type="work")
+    
+    async def show_personal_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает только личные задачи"""
+        await self.show_tasks(update, context, task_type="personal")
+    
+    async def motivate_all(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Мотивация по всем задачам"""
+        await self._send_motivation(update.effective_chat.id, context, focus_work=False)
+    
+    async def motivate_work(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Мотивация только по рабочим задачам"""
+        await self._send_motivation(update.effective_chat.id, context, focus_work=True)
+    
+    async def motivate_personal(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Мотивация только по личным задачам"""
+        await self._send_motivation(update.effective_chat.id, context, focus_work=False, personal_only=True)
+    
+    async def _send_motivation(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE, 
+                               focus_work: bool = False, personal_only: bool = False):
+        """Внутренний метод для отправки мотивации"""
+        try:
+            # Отправляем статус "печатает"
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            
+            # Получаем настройки пользователя
+            user_id = chat_id
+            settings = self.db.get_user_settings(user_id)
+            status_filter = set(settings["status_filter"])
+            
+            # Получаем и классифицируем задачи
+            all_tasks = self.parser.parse_all_tasks(filter_by_date=True, status_filter=status_filter)
+            all_tasks = await self._classify_tasks(all_tasks)
+            
+            # Фильтруем по типу
+            if focus_work:
+                filtered_tasks = [t for t in all_tasks if t.is_work and not t.completed]
+                task_type_text = "рабочим"
+            elif personal_only:
+                filtered_tasks = [t for t in all_tasks if t.is_work is False and not t.completed]
+                task_type_text = "личным"
+            else:
+                filtered_tasks = [t for t in all_tasks if not t.completed]
+                task_type_text = "всем"
+            
+            if filtered_tasks:
+                # Генерируем мотивацию
+                motivation = await self.motivator.generate_motivation(filtered_tasks, focus_work=focus_work)
+                
+                # Отмечаем задачи как отправленные
+                for task in filtered_tasks[:10]:
+                    self.db.mark_task_sent(task.id, chat_id)
+                
+                # Отправляем сообщение
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"💪 **Мотивация по {task_type_text} задачам:**\n\n{motivation}",
+                    parse_mode='Markdown'
+                )
+            else:
+                task_type = "рабочих" if focus_work else "личных" if personal_only else ""
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🎉 Нет невыполненных {task_type} задач! Отличная работа!"
+                )
+                
+        except Exception as e:
+            logger.error(f"Ошибка при генерации мотивации: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Не удалось получить мотивацию. Попробуй позже."
+            )
+    
+    async def status_filter_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Меню настройки фильтра по статусам"""
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        current_filter = set(settings["status_filter"])
+        
+        text = "🎯 **Настройка фильтра по статусам**\n\n"
+        text += "Выбери какие статусы показывать в /tasks:\n\n"
+        
+        keyboard = []
+        row = []
+        
+        for i, status in enumerate(self.AVAILABLE_STATUSES):
+            emoji = self._get_status_emoji(status)
+            status_text = f"{emoji} {status}"
+            if status in current_filter:
+                status_text = f"✅ {status_text}"
+            
+            button = InlineKeyboardButton(status_text, callback_data=f"toggle_status_{status}")
+            row.append(button)
+            
+            # По 2 кнопки в ряд
+            if len(row) == 2 or i == len(self.AVAILABLE_STATUSES) - 1:
+                keyboard.append(row)
+                row = []
+        
+        keyboard.append([InlineKeyboardButton("✅ Выбрать все", callback_data="status_all"),
+                        InlineKeyboardButton("❌ Очистить все", callback_data="status_none")])
+        keyboard.append([InlineKeyboardButton("◀️ Назад к задачам", callback_data="back_to_tasks")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(text, parse_mode='Markdown', reply_markup=reply_markup)
+    
+    async def toggle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Включает/выключает статус в фильтре"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        status = query.data.replace("toggle_status_", "")
+        
+        settings = self.db.get_user_settings(user_id)
+        current_filter = set(settings["status_filter"])
+        
+        if status in current_filter:
+            current_filter.remove(status)
+        else:
+            current_filter.add(status)
+        
+        # Сохраняем настройки
+        self.db.update_user_settings(user_id, status_filter=list(current_filter))
+        
+        # Обновляем меню
+        await self.status_filter_menu(update, context)
+    
+    async def set_all_statuses(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает все статусы или очищает"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        action = query.data.replace("status_", "")
+        
+        if action == "all":
+            status_filter = self.AVAILABLE_STATUSES.copy()
+            await query.edit_message_text("✅ Показываю все статусы")
+        else:  # none
+            status_filter = []
+            await query.edit_message_text("❌ Фильтр статусов очищен")
+        
+        self.db.update_user_settings(user_id, status_filter=status_filter)
+        
+        # Показываем задачи с новым фильтром
+        await self.show_tasks(update, context)
+    
+    async def reset_filters(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Сбрасывает фильтры к значениям по умолчанию"""
+        query = update.callback_query
+        await query.answer()
+        
+        user_id = update.effective_user.id
+        default_filter = self.db.default_status_filter.copy()
+        
+        self.db.update_user_settings(user_id, status_filter=default_filter)
+        self.parser.max_months = 3
+        
+        await query.edit_message_text("🔄 Фильтры сброшены к значениям по умолчанию")
+        
+        # Показываем задачи
+        await self.show_tasks(update, context)
+    
+    async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает статистику по задачам"""
+        try:
+            user_id = update.effective_user.id
+            settings = self.db.get_user_settings(user_id)
+            status_filter = set(settings["status_filter"])
+            
+            all_tasks = self.parser.parse_all_tasks(filter_by_date=True)
+            all_tasks = await self._classify_tasks(all_tasks)
+            
+            if not all_tasks:
+                await update.message.reply_text("❌ Нет данных для статистики")
+                return
+            
+            # Статистика по статусам
+            status_stats = {}
+            for task in all_tasks:
+                status = task.status or 'без статуса'
+                status_stats[status] = status_stats.get(status, 0) + 1
+            
+            # Статистика по рабочим/личным
+            work_count = len([t for t in all_tasks if t.is_work])
+            personal_count = len([t for t in all_tasks if t.is_work is False])
+            unknown_count = len([t for t in all_tasks if t.is_work is None])
+            
+            # Статистика по выбранным статусам
+            filtered_count = len([t for t in all_tasks if t.status in status_filter])
+            
+            # Статистика по дедлайнам
+            now = datetime.now()
+            overdue = len([t for t in all_tasks if not t.completed and t.deadline and t.deadline < now])
+            due_today = len([t for t in all_tasks if not t.completed and t.deadline and t.deadline.date() == now.date()])
+            
+            # Статистика по приоритетам
+            high_priority = len([t for t in all_tasks if not t.completed and t.priority == "высокий"])
+            
+            # Статистика по возрасту задач
+            young_tasks = len([t for t in all_tasks if t.created_date and (datetime.now() - t.created_date).days < 30])
+            
+            period_text = f"за последние {self.parser.max_months} месяцев" if self.parser.max_months > 0 else "за всё время"
+            
+            stats_text = f"""
+📊 **Статистика задач Logseq {period_text}:**
+
+**Общая статистика:**
+📋 Всего задач: {len(all_tasks)}
+🎯 По текущему фильтру: {filtered_count}
+
+**Типы задач:**
+💼 Рабочих: {work_count}
+🏠 Личных: {personal_count}
+❓ Не определено: {unknown_count}
+
+**Статусы задач:**
+{chr(10).join([f"{self._get_status_emoji(status)} {status}: {count}" for status, count in sorted(status_stats.items()) if status != 'без статуса'])}
+
+**Срочность:**
+⚠️ Просрочено: {overdue}
+🔥 На сегодня: {due_today}
+
+**Приоритеты:**
+🔴 Высокий приоритет: {high_priority}
+
+**Возраст задач:**
+🌱 Молодые (<30 дней): {young_tasks}
+            """
+            
+            await update.message.reply_text(stats_text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Ошибка при показе статистики: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+    
+    async def settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Настройки пользователя"""
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        
+        status_text = ', '.join([f"{self._get_status_emoji(s)} {s}" for s in settings["status_filter"]])
+        
+        settings_text = f"""
+⚙️ **Настройки:**
+
+Время уведомлений: {settings['notify_time']}
+Часовой пояс: {settings['timezone']}
+Автомотивация: {'✅ Вкл' if settings['auto_motivation'] else '❌ Выкл'}
+Период фильтрации: {self.parser.max_months if self.parser.max_months > 0 else 'Все задачи'} мес.
+Фильтр статусов: {status_text}
+
+**Команды для изменения:**
+/set_time ЧЧ:ММ - установить время уведомлений
+/set_timezone Europe/Moscow - установить часовой пояс
+/toggle_auto - вкл/выкл автоматические уведомления
+/filter - настроить фильтр по статусам
+        """
+        
+        await update.message.reply_text(settings_text, parse_mode='Markdown')
+    
+    async def set_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает время уведомлений"""
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажи время в формате ЧЧ:ММ, например:\n"
+                "/set_time 09:00\n"
+                "/set_time 18:30"
+            )
+            return
+        
+        time_str = context.args[0]
+        if not re.match(r'^([0-1][0-9]|2[0-3]):[0-5][0-9]$', time_str):
+            await update.message.reply_text(
+                "❌ Неправильный формат. Используй ЧЧ:ММ (например, 09:00 или 18:30)"
+            )
+            return
+        
+        self.db.update_user_settings(update.effective_user.id, notify_time=time_str)
+        await update.message.reply_text(f"✅ Время уведомлений установлено на {time_str}")
+    
+    async def set_timezone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает часовой пояс"""
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажи часовой пояс, например:\n"
+                "/set_timezone Europe/Moscow\n"
+                "/set_timezone Asia/Yekaterinburg\n"
+                "/set_timezone Europe/London\n"
+                "/set_timezone UTC"
+            )
+            return
+        
+        timezone = context.args[0]
+        # Проверяем существование часового пояса
+        try:
+            pytz.timezone(timezone)
+        except pytz.exceptions.UnknownTimeZoneError:
+            await update.message.reply_text(
+                f"❌ Неизвестный часовой пояс '{timezone}'. \n"
+                "Попробуйте: Europe/Moscow, Europe/London, America/New_York, Asia/Yekaterinburg, UTC"
+            )
+            return
+        
+        self.db.update_user_settings(update.effective_user.id, timezone=timezone)
+        await update.message.reply_text(f"✅ Часовой пояс установлен: {timezone}")
+    
+    async def toggle_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Включает/выключает автоматическую мотивацию"""
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        
+        new_value = not settings['auto_motivation']
+        self.db.update_user_settings(user_id, auto_motivation=new_value)
+        
+        status = "включена" if new_value else "выключена"
+        await update.message.reply_text(f"✅ Автомотивация {status}")
+    
+    async def change_period(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Изменяет период фильтрации задач"""
+        query = update.callback_query
+        await query.answer()
+        
+        keyboard = [
+            [InlineKeyboardButton("1 месяц", callback_data="period_1")],
+            [InlineKeyboardButton("3 месяца", callback_data="period_3")],
+            [InlineKeyboardButton("6 месяцев", callback_data="period_6")],
+            [InlineKeyboardButton("Все задачи", callback_data="period_0")],
+            [InlineKeyboardButton("◀️ Назад к задачам", callback_data="back_to_tasks")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "⏰ **Выбери период для отображения задач:**\n\n"
+            "Задачи из папки journals фильтруются по дате в имени файла.\n"
+            "Задачи из pages показываются всегда.",
+            parse_mode='Markdown',
+            reply_markup=reply_markup
+        )
+    
+    async def set_period(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает период фильтрации"""
+        query = update.callback_query
+        await query.answer()
+        
+        period = query.data.replace("period_", "")
+        
+        if period == "0":
+            self.parser.max_months = 0  # Без фильтрации
+            await query.edit_message_text("✅ Показываю все задачи без ограничений")
+        else:
+            self.parser.max_months = int(period)
+            await query.edit_message_text(f"✅ Показываю задачи не старше {period} месяцев")
+        
+        # Показываем задачи с новым периодом
+        await self.show_tasks(update, context)
+    
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обрабатывает нажатия на кнопки"""
+        query = update.callback_query
+        data = query.data
+        
+        if data == "motivate":
+            await self._send_motivation(query.message.chat_id, context, focus_work=False)
+        elif data == "motivate_work":
+            await self._send_motivation(query.message.chat_id, context, focus_work=True)
+        elif data == "stats":
+            # Создаем фейковый update для show_stats
+            class FakeUpdate:
+                def __init__(self, chat_id, message):
+                    self.effective_chat = type('obj', (object,), {'id': chat_id})
+                    self.message = message
+                    self.effective_user = type('obj', (object,), {'id': chat_id})
+            
+            fake_update = FakeUpdate(query.message.chat_id, query.message)
+            await self.show_stats(fake_update, context)
+        elif data == "change_period":
+            await self.change_period(update, context)
+        elif data.startswith("period_"):
+            await self.set_period(update, context)
+        elif data == "change_status_filter":
+            await self.status_filter_menu(update, context)
+        elif data.startswith("toggle_status_"):
+            await self.toggle_status(update, context)
+        elif data.startswith("status_"):
+            await self.set_all_statuses(update, context)
+        elif data == "reset_filters":
+            await self.reset_filters(update, context)
+        elif data == "back_to_tasks":
+            await self.show_tasks(update, context)
+    
+    async def scheduled_motivation(self, context: ContextTypes.DEFAULT_TYPE):
+        """Запланированная отправка мотивации всем пользователям"""
+        try:
+            # Получаем всех пользователей из базы
+            with sqlite3.connect(self.db.db_path) as conn:
+                cursor = conn.execute("SELECT user_id, notify_time, timezone, auto_motivation FROM user_settings")
+                users = cursor.fetchall()
+            
+            for user_id, notify_time, timezone, auto_motivation in users:
+                if not auto_motivation:
+                    continue
+                
+                # Проверяем, нужно ли отправлять сейчас (с учетом часового пояса)
+                try:
+                    tz = pytz.timezone(timezone)
+                    now = datetime.now(tz)
+                    current_time = now.strftime("%H:%M")
+                    
+                    if current_time == notify_time:
+                        await self._send_motivation(user_id, context, focus_work=False)
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке уведомления пользователю {user_id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Ошибка в scheduled_motivation: {e}")
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает справку"""
+        help_text = """
+📚 **Справка по командам:**
+
+**Основные команды:**
+/tasks - показать все задачи
+/work - показать только рабочие задачи
+/personal - показать только личные задачи
+/motivate - мотивация по всем задачам
+/motivate_work - мотивация только по рабочим задачам
+/motivate_personal - мотивация только по личным задачам
+/stats - статистика по задачам
+/filter - настроить фильтр по статусам
+/settings - настройки уведомлений
+
+**Настройка:**
+/setpath /путь/к/logseq - установить путь к Logseq
+/set_time ЧЧ:ММ - установить время уведомлений
+/set_timezone Europe/Moscow - установить часовой пояс
+/toggle_auto - вкл/выкл автоматические уведомления
+
+**Фильтрация задач:**
+• По дате: задачи из журналов за последние N месяцев
+• По статусам: можно выбрать какие статусы показывать
+• 💼 По типу: рабочие или личные (определяет ИИ)
+
+**Статусы Logseq:**
+📝 TODO - нужно сделать
+⚡ DOING - в процессе
+✅ DONE - выполнено
+🔥 NOW - делаю сейчас
+⏳ LATER - отложено
+⏸️ WAITING - ожидание
+❌ CANCELED - отменено
+
+**Примеры задач:**
+- TODO Написать отчет DEADLINE: <2024-12-31> PRIORITY: высокий
+- DOING Работа над проектом #важно
+- [ ] Купить продукты :дом:
+- LATER Изучить Python scheduled:: 2024-12-20
+        """
+        
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+    
+    def run(self):
+        """Запускает бота"""
+        # Создаем приложение
+        application = Application.builder().token(self.token).build()
+        
+        # Добавляем обработчики команд
+        application.add_handler(CommandHandler("start", self.start))
+        application.add_handler(CommandHandler("help", self.help_command))
+        application.add_handler(CommandHandler("setpath", self.set_path))
+        application.add_handler(CommandHandler("tasks", self.show_tasks))
+        application.add_handler(CommandHandler("work", self.show_work_tasks))
+        application.add_handler(CommandHandler("personal", self.show_personal_tasks))
+        application.add_handler(CommandHandler("motivate", self.motivate_all))
+        application.add_handler(CommandHandler("motivate_work", self.motivate_work))
+        application.add_handler(CommandHandler("motivate_personal", self.motivate_personal))
+        application.add_handler(CommandHandler("stats", self.show_stats))
+        application.add_handler(CommandHandler("filter", self.status_filter_menu))
+        application.add_handler(CommandHandler("settings", self.settings))
+        application.add_handler(CommandHandler("set_time", self.set_time))
+        application.add_handler(CommandHandler("set_timezone", self.set_timezone))
+        application.add_handler(CommandHandler("toggle_auto", self.toggle_auto))
+        
+        # Обработчики кнопок
+        application.add_handler(CallbackQueryHandler(self.button_callback))
+        
+        # Планировщик задач
+        job_queue = application.job_queue
+        if job_queue:
+            # Проверяем каждую минуту, нужно ли отправлять уведомления
+            job_queue.run_repeating(self.scheduled_motivation, interval=60, first=10)
+        
+        # Запускаем бота
+        print("🤖 Бот запущен...")
+        print(f"📁 Путь к Logseq: {self.logseq_path}")
+        print(f"⏰ Период фильтрации: {self.parser.max_months if self.parser.max_months > 0 else 'Все задачи'} мес.")
+        print(f"🎯 Фильтр статусов по умолчанию: {', '.join(self.db.default_status_filter)}")
+        print("🔄 Нажми Ctrl+C для остановки")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+# Файл конфигурации
+def create_config():
+    """Создает файл конфигурации"""
+    config = """# Конфигурация бота
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Получите у @BotFather
+LOGSEQ_PATH = "/home/user/Documents/logseq"   # Путь к вашей базе Logseq
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "llama2"  # или "mistral", "codellama", "llama3", "phi"
+
+# Настройки фильтрации по умолчанию
+MAX_MONTHS = 3  # Показывать задачи не старше N месяцев (0 = все задачи)
+DEFAULT_STATUS_FILTER = ["TODO", "DOING", "NOW", "LATER"]  # Статусы по умолчанию
+
+# Настройки для определения рабочих задач
+WORK_KEYWORDS = [
+    "работа", "work", "job", "проект", "project", "task", "задача",
+    "дедлайн", "deadline", "отчет", "report", "клиент", "client",
+    "встреча", "meeting", "презентация", "presentation", "код", "code",
+    "разработка", "development", "баг", "bug", "фича", "feature",
+    "документация", "documentation", "письмо", "email", "звонок", "call"
+]
+
+WORK_TAGS = ["работа", "work", "job", "проект", "клиент", "рабочее"]
+
+PERSONAL_KEYWORDS = [
+    "личное", "personal", "дом", "home", "семья", "family",
+    "отдых", "rest", "хобби", "hobby", "спорт", "sport",
+    "здоровье", "health", "магазин", "shop", "купить", "buy"
+]
+"""
+    
+    with open("config.py", "w") as f:
+        f.write(config)
+    
+    print("✅ Создан файл config.py. Отредактируйте его с вашими настройками.")
+
+# Файл зависимостей
+def create_requirements():
+    """Создает файл с зависимостями"""
+    requirements = """python-telegram-bot==20.7
+aiohttp==3.9.1
+aiofiles==23.2.1
+pytz==2023.3
+"""
+    
+    with open("requirements.txt", "w") as f:
+        f.write(requirements)
+    
+    print("✅ Создан файл requirements.txt")
+
+# Основной запуск
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--init":
+        create_config()
+        create_requirements()
+        print("""
+🚀 Инициализация завершена!
+
+Дальнейшие действия:
+
+1️⃣ Установите зависимости:
+   pip install -r requirements.txt
+
+2️⃣ Отредактируйте config.py:
+   - BOT_TOKEN: получите у @BotFather в Telegram
+   - LOGSEQ_PATH: укажите путь к вашей базе Logseq
+   - MAX_MONTHS: период фильтрации задач (0 = все задачи)
+   - DEFAULT_STATUS_FILTER: список статусов по умолчанию
+   - WORK_KEYWORDS: ключевые слова для определения рабочих задач
+   - WORK_TAGS: теги для рабочих задач
+   - PERSONAL_KEYWORDS: ключевые слова для личных задач
+
+3️⃣ Убедитесь, что Ollama запущена:
+   ollama serve
+   
+   И скачайте модель:
+   ollama pull llama2
+
+4️⃣ Запустите бота:
+   python bot.py
+
+5️⃣ В Telegram отправьте боту /start и настройте путь:
+   /setpath /путь/к/logseq
+
+6️⃣ Попробуйте новые команды:
+   /work - только рабочие задачи
+   /personal - только личные задачи
+   /motivate_work - мотивация по работе
+        """)
+    else:
+        try:
+            from config import (BOT_TOKEN, LOGSEQ_PATH, OLLAMA_URL, OLLAMA_MODEL, 
+                              MAX_MONTHS, DEFAULT_STATUS_FILTER,
+                              WORK_KEYWORDS, WORK_TAGS, PERSONAL_KEYWORDS)
+        except ImportError as e:
+            print(f"❌ Ошибка импорта: {e}")
+            print("Запустите с параметром --init для создания файла config.py:")
+            print("python bot.py --init")
+            sys.exit(1)
+        
+        # Проверяем наличие токена
+        if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+            print("❌ Не указан BOT_TOKEN в config.py")
+            print("Получите токен у @BotFather и отредактируйте config.py")
+            sys.exit(1)
+        
+        # Проверяем путь к Logseq
+        if LOGSEQ_PATH == "/home/user/Documents/logseq":
+            print("⚠️  Путь к Logseq не изменен в config.py")
+            print("   Укажите правильный путь или используйте /setpath в боте")
+        
+        bot = LogseqBot(
+            token=BOT_TOKEN,
+            logseq_path=LOGSEQ_PATH,
+            ollama_url=OLLAMA_URL,
+            ollama_model=OLLAMA_MODEL,
+            max_months=MAX_MONTHS,
+            default_status_filter=DEFAULT_STATUS_FILTER,
+            work_keywords=WORK_KEYWORDS,
+            work_tags=WORK_TAGS,
+            personal_keywords=PERSONAL_KEYWORDS
+        )
+        bot.run()

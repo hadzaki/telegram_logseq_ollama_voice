@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+import os
+import sys
+import logging
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+# Добавляем путь к модулям
+sys.path.append(str(Path(__file__).parent))
+
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    filters,
+    JobQueue
+)
+from telegram import Update
+import pytz
+
+from modules.parser import LogseqTaskParser
+from modules.classifier import WorkTaskClassifier
+from modules.motivator import MotivationGenerator
+from modules.database import TaskDatabase
+from modules.voice_creator import VoiceTaskCreator
+from modules.handlers import BotHandlers  # Импортируем напрямую
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+class LogseqBot:
+    """Основной класс бота"""
+    
+    def __init__(self, config):
+        self.config = config
+        self.token = config['BOT_TOKEN']
+        
+        # Инициализация компонентов
+        self.parser = LogseqTaskParser(
+            config['LOGSEQ_PATH'], 
+            config.get('MAX_MONTHS', 3)
+        )
+        
+        self.classifier = WorkTaskClassifier(
+            base_url=config.get('OLLAMA_URL', 'http://localhost:11434'),
+            model=config.get('OLLAMA_MODEL', 'llama2'),
+            work_keywords=config.get('WORK_KEYWORDS'),
+            work_tags=config.get('WORK_TAGS'),
+            personal_keywords=config.get('PERSONAL_KEYWORDS')
+        )
+        
+        self.motivator = MotivationGenerator(
+            base_url=config.get('OLLAMA_URL', 'http://localhost:11434'),
+            model=config.get('OLLAMA_MODEL', 'llama2')
+        )
+        
+        self.db = TaskDatabase(
+            default_status_filter=config.get('DEFAULT_STATUS_FILTER', ['TODO', 'DOING', 'NOW', 'LATER'])
+        )
+        
+        self.voice_creator = VoiceTaskCreator(
+            logseq_path=config['LOGSEQ_PATH'],
+            default_page=config.get('VOICE_TASK_PAGE', 'Inbox'),
+            default_status=config.get('DEFAULT_TASK_STATUS', 'TODO'),
+            classifier=self.classifier if config.get('AUTO_CLASSIFY_VOICE', True) else None
+        )
+        
+        # Инициализация обработчиков
+        self.handlers = BotHandlers(
+            parser=self.parser,
+            classifier=self.classifier,
+            motivator=self.motivator,
+            db=self.db,
+            voice_creator=self.voice_creator
+        )
+        
+    async def scheduled_motivation(self, context):
+        """Запланированная отправка мотивации"""
+        try:
+            with sqlite3.connect(self.db.db_path) as conn:
+                cursor = conn.execute(
+                    "SELECT user_id, notify_time, timezone, auto_motivation FROM user_settings"
+                )
+                users = cursor.fetchall()
+            
+            for user_id, notify_time, timezone, auto_motivation in users:
+                if not auto_motivation:
+                    continue
+                
+                try:
+                    tz = pytz.timezone(timezone)
+                    now = datetime.now(tz)
+                    current_time = now.strftime("%H:%M")
+                    
+                    if current_time == notify_time:
+                        await self.handlers._send_motivation(user_id, context, focus_work=False)
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке уведомления пользователю {user_id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Ошибка в scheduled_motivation: {e}")
+    
+    def run(self):
+        """Запускает бота"""
+        application = Application.builder().token(self.token).build()
+        
+        # Команды
+        application.add_handler(CommandHandler("start", self.handlers.start))
+        application.add_handler(CommandHandler("help", self.handlers.help_command))
+        application.add_handler(CommandHandler("setpath", self.handlers.set_path))
+        application.add_handler(CommandHandler("tasks", self.handlers.show_tasks))
+        application.add_handler(CommandHandler("work", self.handlers.show_work_tasks))
+        application.add_handler(CommandHandler("personal", self.handlers.show_personal_tasks))
+        application.add_handler(CommandHandler("motivate", self.handlers.motivate))
+        application.add_handler(CommandHandler("motivate_work", self.handlers.motivate_work))
+        application.add_handler(CommandHandler("stats", self.handlers.show_stats))
+        application.add_handler(CommandHandler("filter", self.handlers.status_filter_menu))
+        application.add_handler(CommandHandler("settings", self.handlers.settings))
+        application.add_handler(CommandHandler("set_time", self.handlers.set_time))
+        application.add_handler(CommandHandler("set_timezone", self.handlers.set_timezone))
+        application.add_handler(CommandHandler("toggle_auto", self.handlers.toggle_auto))
+        
+        # Голосовые сообщения
+        application.add_handler(MessageHandler(filters.VOICE, self.handlers.handle_voice))
+        
+        # Кнопки
+        application.add_handler(CallbackQueryHandler(self.handlers.button_callback))
+        
+        # Планировщик
+        job_queue = application.job_queue
+        if job_queue:
+            job_queue.run_repeating(self.scheduled_motivation, interval=60, first=10)
+        
+        # Запуск
+        print("🤖 Бот запущен...")
+        print(f"📁 Путь к Logseq: {self.parser.logseq_path}")
+        print(f"🎤 Голосовые задачи сохраняются в: {self.voice_creator.default_page}.md")
+        print("🔄 Нажми Ctrl+C для остановки")
+        
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+def main():
+    """Точка входа"""
+    try:
+        from config import (
+            BOT_TOKEN, LOGSEQ_PATH, OLLAMA_URL, OLLAMA_MODEL,
+            MAX_MONTHS, DEFAULT_STATUS_FILTER,
+            WORK_KEYWORDS, WORK_TAGS, PERSONAL_KEYWORDS,
+            VOICE_TASK_PAGE, DEFAULT_TASK_STATUS, AUTO_CLASSIFY_VOICE
+        )
+        
+        config = {
+            'BOT_TOKEN': BOT_TOKEN,
+            'LOGSEQ_PATH': LOGSEQ_PATH,
+            'OLLAMA_URL': OLLAMA_URL,
+            'OLLAMA_MODEL': OLLAMA_MODEL,
+            'MAX_MONTHS': MAX_MONTHS,
+            'DEFAULT_STATUS_FILTER': DEFAULT_STATUS_FILTER,
+            'WORK_KEYWORDS': WORK_KEYWORDS,
+            'WORK_TAGS': WORK_TAGS,
+            'PERSONAL_KEYWORDS': PERSONAL_KEYWORDS,
+            'VOICE_TASK_PAGE': VOICE_TASK_PAGE,
+            'DEFAULT_TASK_STATUS': DEFAULT_TASK_STATUS,
+            'AUTO_CLASSIFY_VOICE': AUTO_CLASSIFY_VOICE
+        }
+        
+    except ImportError as e:
+        print(f"❌ Ошибка импорта config.py: {e}")
+        print("Запустите с параметром --init для создания:")
+        print("python bot.py --init")
+        sys.exit(1)
+    
+    if config['BOT_TOKEN'] == "YOUR_BOT_TOKEN_HERE":
+        print("❌ Не указан BOT_TOKEN в config.py")
+        sys.exit(1)
+    
+    bot = LogseqBot(config)
+    bot.run()
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--init":
+        # Создание файлов конфигурации
+        from config_creator import create_config, create_requirements
+        create_config()
+        create_requirements()
+        print("""
+🚀 Инициализация завершена!
+
+Дальнейшие действия:
+
+1️⃣ Установите системные зависимости:
+   sudo apt-get update
+   sudo apt-get install ffmpeg
+
+2️⃣ Установите Python зависимости:
+   pip install -r requirements.txt
+
+3️⃣ Отредактируйте config.py с вашими настройками
+
+4️⃣ Запустите бота:
+   python bot.py
+        """)
+    else:
+        main()

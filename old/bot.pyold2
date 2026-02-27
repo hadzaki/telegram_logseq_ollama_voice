@@ -1,0 +1,1067 @@
+import os
+import re
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+import sqlite3
+from dataclasses import dataclass, field
+import pytz
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    JobQueue
+)
+import aiohttp
+import json
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class Task:
+    """Класс для хранения информации о задаче с поддержкой Logseq формата"""
+    id: str
+    content: str
+    deadline: Optional[datetime]
+    priority: str
+    file_path: str
+    line_number: int
+    completed: bool = False
+    scheduled: Optional[datetime] = None  # Запланированная дата
+    tags: List[str] = field(default_factory=list)  # Теги задачи
+    status: Optional[str] = None  # TODO, DOING, DONE и т.д.
+    parent_id: Optional[str] = None  # ID родительской задачи
+
+class LogseqTaskParser:
+    """Парсер задач из файлов Logseq с поддержкой TODO формата"""
+    
+    def __init__(self, logseq_path: str):
+        self.logseq_path = Path(logseq_path)
+        self.journals_path = self.logseq_path / "journals"
+        self.pages_path = self.logseq_path / "pages"
+        
+        # Все возможные статусы задач в Logseq
+        self.task_statuses = {
+            'TODO': 'не выполнено',
+            'DOING': 'в процессе',
+            'NOW': 'в процессе',
+            'LATER': 'отложено',
+            'WAITING': 'ожидание',
+            'DONE': 'выполнено',
+            'CANCELED': 'отменено',
+            '✔': 'выполнено',
+            '❌': 'отменено',
+            '▶': 'в процессе',
+            '⏸': 'приостановлено',
+            '✅': 'выполнено',
+            '⬜': 'не выполнено'
+        }
+        
+    def parse_all_tasks(self) -> List[Task]:
+        """Парсит все задачи из всех файлов"""
+        tasks = []
+        
+        # Проверяем существование пути
+        if not self.logseq_path.exists():
+            logger.error(f"Путь не существует: {self.logseq_path}")
+            return tasks
+        
+        # Парсим файлы журналов
+        if self.journals_path.exists():
+            for file_path in self.journals_path.glob("*.md"):
+                tasks.extend(self._parse_file(file_path))
+        
+        # Парсим страницы
+        if self.pages_path.exists():
+            for file_path in self.pages_path.glob("*.md"):
+                tasks.extend(self._parse_file(file_path))
+        
+        # Парсим файлы в корне (некоторые версии Logseq хранят там страницы)
+        for file_path in self.logseq_path.glob("*.md"):
+            if file_path.name not in ['README.md', 'index.md']:
+                tasks.extend(self._parse_file(file_path))
+        
+        logger.info(f"Всего найдено задач: {len(tasks)}")
+        return tasks
+    
+    def _parse_file(self, file_path: Path) -> List[Task]:
+        """Парсит один файл с поддержкой вложенных задач"""
+        tasks = []
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            # Отслеживаем уровень вложенности
+            task_stack = []  # (task, indent_level)
+            
+            for i, line in enumerate(lines):
+                # Определяем уровень отступа (количество пробелов в начале)
+                raw_line = line
+                indent_level = len(raw_line) - len(raw_line.lstrip())
+                
+                # Ищем задачи в формате Logseq
+                task = self._parse_line(line, file_path, i + 1)
+                
+                if task:
+                    # Если есть стек задач, устанавливаем родителя
+                    while task_stack and task_stack[-1][1] >= indent_level:
+                        task_stack.pop()
+                    
+                    if task_stack:
+                        task.parent_id = task_stack[-1][0].id
+                    
+                    tasks.append(task)
+                    task_stack.append((task, indent_level))
+                    
+        except Exception as e:
+            logger.error(f"Ошибка при парсинге файла {file_path}: {e}")
+            
+        return tasks
+    
+    def _parse_line(self, line: str, file_path: Path, line_number: int) -> Optional[Task]:
+        """Парсит одну строку и извлекает задачу в формате Logseq"""
+        
+        # Сохраняем оригинальную строку
+        original_line = line
+        line = line.strip()
+        
+        # Пропускаем пустые строки и заголовки
+        if not line or line.startswith('#'):
+            return None
+        
+        # Ищем задачи с маркерами
+        status = None
+        content = None
+        completed = False
+        
+        # Паттерны для разных форматов Logseq
+        patterns = [
+            # TODO/DOING/DONE формат (основной)
+            (r'^[-*]\s*(TODO|DOING|DONE|LATER|NOW|WAITING|CANCELED)\s+(.*)', True),
+            # Формат с квадратными скобками
+            (r'^[-*]\s*\[( |x|X|\.|>|✔|❌|✅|⬜)\]\s*(.*)', True),
+            # Формат с приоритетом в скобках
+            (r'^[-*]\s*(TODO|DOING|DONE)\s+\[([A-C])\]\s+(.*)', True),
+            # Формат с эмодзи
+            (r'^[-*]\s*(✔|❌|▶|⏸|✅|⬜|🔴|🟡|🟢)\s+(.*)', True),
+            # Формат без маркера, но с тегами (может быть задачей)
+            (r'^[-*]\s+([^#].*?)(?:\s+#\w+)*$', False)
+        ]
+        
+        for pattern, has_status in patterns:
+            match = re.search(pattern, line)
+            if match:
+                if has_status:
+                    if len(match.groups()) == 2:
+                        status = match.group(1)
+                        content = match.group(2)
+                    elif len(match.groups()) == 3:
+                        status = match.group(1)
+                        content = match.group(3)
+                else:
+                    content = match.group(1)
+                break
+        
+        # Если не нашли задачу по паттернам, проверяем наличие тегов
+        if not content:
+            if re.search(r'#\w+', line) and line.startswith(('-', '*')):
+                content = line.lstrip('-* ').strip()
+            else:
+                return None
+        
+        # Определяем выполненность задачи
+        if status:
+            status_upper = status.upper()
+            if status_upper in ['DONE', 'CANCELED'] or status in ['✔', '✅', '❌']:
+                completed = True
+            elif status_upper in ['TODO', 'LATER', 'WAITING'] or status in ['⬜']:
+                completed = False
+            elif status_upper in ['DOING', 'NOW'] or status in ['▶']:
+                completed = False  # В процессе - не выполнено
+        else:
+            # Если нет статуса, считаем невыполненной, если нет маркера выполнения
+            completed = False
+        
+        # Извлекаем дедлайн из разных форматов
+        deadline = self._extract_deadline(original_line)
+        
+        # Извлекаем приоритет
+        priority = self._extract_priority(original_line, status)
+        
+        # Извлекаем запланированную дату
+        scheduled = self._extract_scheduled(original_line)
+        
+        # Извлекаем теги
+        tags = self._extract_tags(original_line)
+        
+        # Создаем ID задачи
+        task_id = f"{file_path.stem}_{line_number}"
+        
+        # Очищаем контент от лишних пробелов
+        content = content.strip()
+        
+        # Обогащаем контент дополнительной информацией (но без дублирования)
+        enriched_content = content
+        
+        return Task(
+            id=task_id,
+            content=enriched_content,
+            deadline=deadline,
+            priority=priority,
+            file_path=str(file_path),
+            line_number=line_number,
+            completed=completed,
+            scheduled=scheduled,
+            tags=tags,
+            status=status,
+            parent_id=None  # Будет установлен в _parse_file
+        )
+    
+    def _extract_deadline(self, line: str) -> Optional[datetime]:
+        """Извлекает дедлайн из разных форматов"""
+        deadline = None
+        
+        # Формат DEADLINE: <2024-12-31>
+        deadline_match = re.search(r'DEADLINE:\s*<(\d{4}-\d{2}-\d{2})', line, re.IGNORECASE)
+        if deadline_match:
+            try:
+                deadline = datetime.strptime(deadline_match.group(1), '%Y-%m-%d')
+                return deadline
+            except ValueError:
+                pass
+        
+        # Формат deadline:: 2024-12-31
+        deadline_match = re.search(r'deadline::\s*(\d{4}-\d{2}-\d{2})', line, re.IGNORECASE)
+        if deadline_match:
+            try:
+                deadline = datetime.strptime(deadline_match.group(1), '%Y-%m-%d')
+                return deadline
+            except ValueError:
+                pass
+        
+        # Формат due: 2024-12-31
+        deadline_match = re.search(r'due:\s*(\d{4}-\d{2}-\d{2})', line, re.IGNORECASE)
+        if deadline_match:
+            try:
+                deadline = datetime.strptime(deadline_match.group(1), '%Y-%m-%d')
+                return deadline
+            except ValueError:
+                pass
+        
+        return None
+    
+    def _extract_scheduled(self, line: str) -> Optional[datetime]:
+        """Извлекает запланированную дату"""
+        scheduled = None
+        
+        # Формат SCHEDULED: <2024-12-20>
+        scheduled_match = re.search(r'SCHEDULED:\s*<(\d{4}-\d{2}-\d{2})', line, re.IGNORECASE)
+        if scheduled_match:
+            try:
+                scheduled = datetime.strptime(scheduled_match.group(1), '%Y-%m-%d')
+            except ValueError:
+                pass
+        
+        # Формат scheduled:: 2024-12-20
+        scheduled_match = re.search(r'scheduled::\s*(\d{4}-\d{2}-\d{2})', line, re.IGNORECASE)
+        if scheduled_match:
+            try:
+                scheduled = datetime.strptime(scheduled_match.group(1), '%Y-%m-%d')
+            except ValueError:
+                pass
+        
+        return scheduled
+    
+    def _extract_priority(self, line: str, status: Optional[str]) -> str:
+        """Извлекает приоритет задачи"""
+        
+        # Приоритет в квадратных скобках [A]
+        priority_match = re.search(r'\[([A-Ca-c])\]', line)
+        if priority_match:
+            priority_map = {'A': 'высокий', 'B': 'средний', 'C': 'обычный',
+                           'a': 'высокий', 'b': 'средний', 'c': 'обычный'}
+            return priority_map.get(priority_match.group(1), 'обычный')
+        
+        # Приоритет PRIORITY: высокий
+        priority_match = re.search(r'PRIORITY:\s*(\w+)', line, re.IGNORECASE)
+        if priority_match:
+            priority = priority_match.group(1).lower()
+            if priority in ['высокий', 'средний', 'обычный', 'high', 'medium', 'low']:
+                priority_map = {'high': 'высокий', 'medium': 'средний', 'low': 'обычный'}
+                return priority_map.get(priority, priority)
+        
+        # Приоритет priority:: A
+        priority_match = re.search(r'priority::\s*([A-Ca-c])', line, re.IGNORECASE)
+        if priority_match:
+            priority_map = {'A': 'высокий', 'B': 'средний', 'C': 'обычный',
+                           'a': 'высокий', 'b': 'средний', 'c': 'обычный'}
+            return priority_map.get(priority_match.group(1), 'обычный')
+        
+        # По умолчанию
+        return 'обычный'
+    
+    def _extract_tags(self, line: str) -> List[str]:
+        """Извлекает теги из строки"""
+        tags = []
+        
+        # Теги в формате #тег
+        tag_matches = re.findall(r'#(\w+)', line)
+        tags.extend(tag_matches)
+        
+        # Теги в формате :тег:
+        tag_matches = re.findall(r':(\w+):', line)
+        tags.extend(tag_matches)
+        
+        return tags
+
+class MotivationGenerator:
+    """Генератор мотивационных сообщений через Ollama"""
+    
+    def __init__(self, base_url: str = "http://localhost:11434", model: str = "llama2"):
+        self.base_url = base_url
+        self.model = model
+        
+    async def generate_motivation(self, tasks: List[Task]) -> str:
+        """Генерирует мотивационное сообщение на основе списка задач"""
+        
+        if not tasks:
+            return "У тебя нет невыполненных задач! Отличная работа! 🎉"
+        
+        # Формируем промпт
+        tasks_desc = []
+        now = datetime.now()
+        
+        for task in tasks[:10]:  # Ограничиваем до 10 задач для промпта
+            deadline_info = ""
+            if task.deadline:
+                days_left = (task.deadline - now).days
+                if days_left < 0:
+                    deadline_info = f"(просрочено на {abs(days_left)} дней)"
+                elif days_left == 0:
+                    deadline_info = "(сегодня дедлайн)"
+                else:
+                    deadline_info = f"(осталось {days_left} дней)"
+            
+            status_emoji = "⚡" if task.status in ['DOING', 'NOW'] else "📝"
+            priority_emoji = "🔴" if task.priority == "высокий" else "🟡" if task.priority == "средний" else "🟢"
+            
+            task_line = f"{status_emoji}{priority_emoji} {task.content} {deadline_info}"
+            if task.tags:
+                task_line += f" #{' #'.join(task.tags)}"
+            
+            tasks_desc.append(task_line)
+        
+        prompt = f"""Ты - мотивационный тренер. У пользователя есть список невыполненных задач из его системы заметок Logseq:
+        
+{chr(10).join(tasks_desc)}
+
+Напиши короткое (не более 500 символов) мотивирующее сообщение, которое подтолкнет его к выполнению этих задач. 
+Будь дружелюбным, используй эмодзи. Не перечисляй все задачи в ответе, просто дай общую мотивацию с учетом их срочности и важности.
+"""
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.7,
+                        "max_tokens": 500
+                    }
+                }
+                
+                async with session.post(f"{self.base_url}/api/generate", json=payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result.get("response", "Давай, ты сможешь! 💪").strip()
+                    else:
+                        logger.error(f"Ошибка Ollama: {response.status}")
+                        return self._get_fallback_message(tasks)
+                        
+        except Exception as e:
+            logger.error(f"Ошибка при обращении к Ollama: {e}")
+            return self._get_fallback_message(tasks)
+    
+    def _get_fallback_message(self, tasks: List[Task]) -> str:
+        """Возвращает запасное сообщение если Ollama недоступна"""
+        now = datetime.now()
+        overdue = [t for t in tasks if t.deadline and t.deadline < now]
+        doing = [t for t in tasks if t.status in ['DOING', 'NOW']]
+        
+        if overdue:
+            return f"⚠️ У тебя {len(overdue)} просроченных задач! Самое время их выполнить. Не откладывай на потом!"
+        elif doing:
+            return f"⚡ Продолжай работу над {len(doing)} задачами в процессе. Ты на правильном пути!"
+        elif tasks:
+            return f"📋 У тебя {len(tasks)} невыполненных задач. Начни с самой важной или срочной!"
+        else:
+            return "Молодец, все задачи выполнены! 🎉"
+
+class TaskDatabase:
+    """База данных для отслеживания отправленных задач"""
+    
+    def __init__(self, db_path: str = "tasks.db"):
+        self.db_path = db_path
+        self._init_db()
+    
+    def _init_db(self):
+        """Инициализирует базу данных"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sent_tasks (
+                    task_id TEXT PRIMARY KEY,
+                    sent_date TIMESTAMP,
+                    user_id INTEGER
+                )
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id INTEGER PRIMARY KEY,
+                    notify_time TEXT,
+                    timezone TEXT,
+                    auto_motivation BOOLEAN DEFAULT 1
+                )
+            """)
+    
+    def mark_task_sent(self, task_id: str, user_id: int):
+        """Отмечает задачу как отправленную"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO sent_tasks (task_id, sent_date, user_id) VALUES (?, ?, ?)",
+                (task_id, datetime.now(), user_id)
+            )
+    
+    def get_sent_tasks(self, user_id: int, hours: int = 24) -> List[str]:
+        """Получает список отправленных задач за последние N часов"""
+        cutoff = datetime.now() - timedelta(hours=hours)
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT task_id FROM sent_tasks WHERE user_id = ? AND sent_date > ?",
+                (user_id, cutoff)
+            )
+            return [row[0] for row in cursor.fetchall()]
+    
+    def get_user_settings(self, user_id: int) -> Dict:
+        """Получает настройки пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT notify_time, timezone, auto_motivation FROM user_settings WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "notify_time": row[0],
+                    "timezone": row[1],
+                    "auto_motivation": bool(row[2])
+                }
+            return {"notify_time": "09:00", "timezone": "Europe/Moscow", "auto_motivation": True}
+    
+    def update_user_settings(self, user_id: int, **kwargs):
+        """Обновляет настройки пользователя"""
+        settings = self.get_user_settings(user_id)
+        settings.update(kwargs)
+        
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO user_settings 
+                   (user_id, notify_time, timezone, auto_motivation) 
+                   VALUES (?, ?, ?, ?)""",
+                (user_id, settings["notify_time"], settings["timezone"], settings["auto_motivation"])
+            )
+
+class LogseqBot:
+    """Основной класс бота"""
+    
+    def __init__(self, token: str, logseq_path: str, ollama_url: str = "http://localhost:11434", ollama_model: str = "llama2"):
+        self.token = token
+        self.logseq_path = logseq_path
+        self.parser = LogseqTaskParser(logseq_path)
+        self.motivator = MotivationGenerator(base_url=ollama_url, model=ollama_model)
+        self.db = TaskDatabase()
+        
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик команды /start"""
+        welcome_text = """
+👋 Привет! Я бот для мотивации выполнения задач из Logseq.
+
+Я анализирую твои задачи в формате Logseq и помогаю с мотивацией.
+
+**Поддерживаемые форматы задач:**
+• TODO / DOING / DONE / LATER / NOW / WAITING
+• [ ] / [x] / [>] / [.]
+• Приоритеты [A], [B], [C]
+• Дедлайны DEADLINE: <2024-12-31>
+• Теги #важно :работа:
+
+**Команды:**
+/tasks - показать невыполненные задачи
+/motivate - получить мотивацию
+/stats - статистика по задачам
+/settings - настройки уведомлений
+/help - помощь
+
+**Для начала работы:**
+1. Укажи путь к твоей базе Logseq: /setpath /путь/к/logseq
+2. Настрой время уведомлений: /set_time 09:00
+3. Укажи часовой пояс: /set_timezone Europe/Moscow
+        """
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    
+    async def set_path(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает путь к Logseq"""
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажи путь к папке Logseq, например:\n"
+                "/setpath /home/user/logseq\n"
+                "/setpath /home/user/Documents/logseq\n"
+                "/setpath /home/user/Logseq"
+            )
+            return
+        
+        path = ' '.join(context.args)
+        
+        # Проверяем существование пути
+        if not os.path.exists(path):
+            await update.message.reply_text(f"❌ Путь не существует: {path}")
+            return
+        
+        # Проверяем наличие папок journals или pages
+        journals_path = os.path.join(path, "journals")
+        pages_path = os.path.join(path, "pages")
+        
+        if not os.path.exists(journals_path) and not os.path.exists(pages_path):
+            await update.message.reply_text(
+                f"❌ В папке {path} не найдены подпапки 'journals' или 'pages'.\n"
+                "Убедись, что это правильная папка Logseq."
+            )
+            return
+        
+        context.user_data['logseq_path'] = path
+        self.parser = LogseqTaskParser(path)
+        
+        # Проверяем, есть ли задачи
+        tasks = self.parser.parse_all_tasks()
+        await update.message.reply_text(
+            f"✅ Путь установлен: {path}\n"
+            f"Найдено задач: {len(tasks)}"
+        )
+    
+    async def show_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает невыполненные задачи с учетом статусов Logseq"""
+        try:
+            all_tasks = self.parser.parse_all_tasks()
+            
+            if not all_tasks:
+                await update.message.reply_text(
+                    "❌ Не найдено ни одной задачи. Проверь:\n"
+                    "1. Правильный ли путь к Logseq (/setpath)\n"
+                    "2. Есть ли файлы .md в папках journals или pages\n"
+                    "3. Есть ли задачи в формате TODO или - [ ]"
+                )
+                return
+            
+            # Фильтруем задачи: не выполнены и не отменены
+            incomplete_tasks = [
+                t for t in all_tasks 
+                if not t.completed and t.status not in ['CANCELED', '❌', 'CANCELED']
+            ]
+            
+            if not incomplete_tasks:
+                await update.message.reply_text("🎉 У тебя нет невыполненных задач! Отличная работа!")
+                return
+            
+            # Группируем по статусам и срочности
+            now = datetime.now()
+            
+            # Задачи в работе
+            doing = [t for t in incomplete_tasks if t.status in ['DOING', 'NOW', '▶']]
+            
+            # Просроченные
+            overdue = [t for t in incomplete_tasks if t.deadline and t.deadline < now]
+            
+            # На сегодня
+            today = [t for t in incomplete_tasks if t.deadline and t.deadline.date() == now.date()]
+            
+            # Запланированные на ближайшее время
+            scheduled = [t for t in incomplete_tasks if t.scheduled and t.scheduled > now and t not in doing]
+            
+            # Обычные TODO
+            todos = [t for t in incomplete_tasks if t.status == 'TODO' and t not in doing and t not in overdue and t not in today and t not in scheduled]
+            
+            # Отложенные
+            later = [t for t in incomplete_tasks if t.status in ['LATER', 'WAITING']]
+            
+            # Формируем сообщение
+            message = f"📋 **Найдено задач: {len(incomplete_tasks)}**\n\n"
+            
+            if doing:
+                message += "⚡ **В работе:**\n"
+                for task in doing[:5]:
+                    message += f"• {task.content}\n"
+                    if task.tags:
+                        message += f"  `{' '.join(['#'+t for t in task.tags])}`\n"
+                if len(doing) > 5:
+                    message += f"  ...и еще {len(doing) - 5}\n"
+                message += "\n"
+            
+            if overdue:
+                message += "🔴 **Просроченные:**\n"
+                for task in overdue[:5]:
+                    days = (now - task.deadline).days
+                    message += f"• {task.content} (просрочено {days} дн.)\n"
+                if len(overdue) > 5:
+                    message += f"  ...и еще {len(overdue) - 5}\n"
+                message += "\n"
+            
+            if today:
+                message += "🔥 **На сегодня:**\n"
+                for task in today[:5]:
+                    message += f"• {task.content}\n"
+                if len(today) > 5:
+                    message += f"  ...и еще {len(today) - 5}\n"
+                message += "\n"
+            
+            if scheduled:
+                message += "📅 **Запланированные:**\n"
+                for task in scheduled[:5]:
+                    days = (task.scheduled - now).days
+                    message += f"• {task.content} (через {days} дн.)\n"
+                if len(scheduled) > 5:
+                    message += f"  ...и еще {len(scheduled) - 5}\n"
+                message += "\n"
+            
+            if todos:
+                message += f"📝 **К выполнению ({len(todos)}):**\n"
+                for task in todos[:5]:
+                    message += f"• {task.content}\n"
+                if len(todos) > 5:
+                    message += f"  ...и еще {len(todos) - 5}\n"
+                message += "\n"
+            
+            if later:
+                message += f"⏳ **Отложенные ({len(later)}):**\n"
+                for task in later[:3]:
+                    message += f"• {task.content}\n"
+                if len(later) > 3:
+                    message += f"  ...и еще {len(later) - 3}\n"
+            
+            # Добавляем кнопки
+            keyboard = [
+                [InlineKeyboardButton("🎯 Получить мотивацию", callback_data="motivate")],
+                [InlineKeyboardButton("📊 Статистика", callback_data="stats")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Разбиваем длинное сообщение
+            if len(message) > 4000:
+                parts = [message[i:i+4000] for i in range(0, len(message), 4000)]
+                for part in parts:
+                    await update.message.reply_text(part, parse_mode='Markdown')
+                await update.message.reply_text("Выбери действие:", reply_markup=reply_markup)
+            else:
+                await update.message.reply_text(message, parse_mode='Markdown', reply_markup=reply_markup)
+            
+        except Exception as e:
+            logger.error(f"Ошибка при показе задач: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+    
+    async def motivate(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отправляет мотивационное сообщение"""
+        await self._send_motivation(update.effective_chat.id, context)
+    
+    async def _send_motivation(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+        """Внутренний метод для отправки мотивации"""
+        try:
+            # Отправляем статус "печатает"
+            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+            
+            all_tasks = self.parser.parse_all_tasks()
+            incomplete_tasks = [t for t in all_tasks if not t.completed and t.status not in ['CANCELED', '❌']]
+            
+            if incomplete_tasks:
+                # Генерируем мотивацию
+                motivation = await self.motivator.generate_motivation(incomplete_tasks)
+                
+                # Отмечаем задачи как отправленные
+                for task in incomplete_tasks[:10]:  # Отмечаем только первые 10
+                    self.db.mark_task_sent(task.id, chat_id)
+                
+                # Отправляем сообщение
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"💪 **Мотивация для тебя:**\n\n{motivation}",
+                    parse_mode='Markdown'
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="🎉 Все задачи выполнены! Отличная работа!"
+                )
+                
+        except Exception as e:
+            logger.error(f"Ошибка при генерации мотивации: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ Не удалось получить мотивацию. Попробуй позже."
+            )
+    
+    async def show_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает статистику по задачам"""
+        try:
+            all_tasks = self.parser.parse_all_tasks()
+            
+            if not all_tasks:
+                await update.message.reply_text("❌ Нет данных для статистики")
+                return
+            
+            total = len(all_tasks)
+            completed = len([t for t in all_tasks if t.completed])
+            incomplete = total - completed
+            
+            # Статистика по статусам
+            status_stats = {}
+            for task in all_tasks:
+                status = task.status or 'без статуса'
+                status_stats[status] = status_stats.get(status, 0) + 1
+            
+            # Статистика по дедлайнам
+            now = datetime.now()
+            overdue = len([t for t in all_tasks if not t.completed and t.deadline and t.deadline < now])
+            due_today = len([t for t in all_tasks if not t.completed and t.deadline and t.deadline.date() == now.date()])
+            due_week = len([t for t in all_tasks if not t.completed and t.deadline and t.deadline < now + timedelta(days=7) and t.deadline > now])
+            
+            # Статистика по приоритетам
+            high_priority = len([t for t in all_tasks if not t.completed and t.priority == "высокий"])
+            medium_priority = len([t for t in all_tasks if not t.completed and t.priority == "средний"])
+            
+            # Статистика по тегам
+            all_tags = []
+            for task in all_tasks:
+                all_tags.extend(task.tags)
+            top_tags = sorted([(tag, all_tags.count(tag)) for tag in set(all_tags)], key=lambda x: x[1], reverse=True)[:5]
+            
+            # Процент выполнения
+            completion_rate = (completed / total * 100) if total > 0 else 0
+            
+            stats_text = f"""
+📊 **Статистика задач Logseq:**
+
+**Общая статистика:**
+📋 Всего задач: {total}
+✅ Выполнено: {completed}
+📝 В работе: {incomplete}
+📈 Прогресс: {completion_rate:.1f}%
+
+**Срочность:**
+⚠️ Просрочено: {overdue}
+🔥 На сегодня: {due_today}
+📅 На неделе: {due_week}
+
+**Приоритеты:**
+🔴 Высокий: {high_priority}
+🟡 Средний: {medium_priority}
+🟢 Обычный: {incomplete - high_priority - medium_priority}
+
+**Популярные теги:**
+{chr(10).join([f"#{tag}: {count}" for tag, count in top_tags]) if top_tags else "Нет тегов"}
+
+**Статусы задач:**
+{chr(10).join([f"{status}: {count}" for status, count in list(status_stats.items())[:5]])}
+            """
+            
+            await update.message.reply_text(stats_text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Ошибка при показе статистики: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+    
+    async def settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Настройки пользователя"""
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        
+        settings_text = f"""
+⚙️ **Настройки:**
+
+Время уведомлений: {settings['notify_time']}
+Часовой пояс: {settings['timezone']}
+Автомотивация: {'✅ Вкл' if settings['auto_motivation'] else '❌ Выкл'}
+
+**Команды для изменения:**
+/set_time ЧЧ:ММ - установить время уведомлений
+/set_timezone Europe/Moscow - установить часовой пояс
+/toggle_auto - вкл/выкл автоматические уведомления
+        """
+        
+        await update.message.reply_text(settings_text, parse_mode='Markdown')
+    
+    async def set_time(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает время уведомлений"""
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажи время в формате ЧЧ:ММ, например:\n"
+                "/set_time 09:00\n"
+                "/set_time 18:30"
+            )
+            return
+        
+        time_str = context.args[0]
+        if not re.match(r'^([0-1][0-9]|2[0-3]):[0-5][0-9]$', time_str):
+            await update.message.reply_text(
+                "❌ Неправильный формат. Используй ЧЧ:ММ (например, 09:00 или 18:30)"
+            )
+            return
+        
+        self.db.update_user_settings(update.effective_user.id, notify_time=time_str)
+        await update.message.reply_text(f"✅ Время уведомлений установлено на {time_str}")
+    
+    async def set_timezone(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Устанавливает часовой пояс"""
+        if not context.args:
+            await update.message.reply_text(
+                "❌ Укажи часовой пояс, например:\n"
+                "/set_timezone Europe/Moscow\n"
+                "/set_timezone Asia/Yekaterinburg\n"
+                "/set_timezone Europe/London\n"
+                "/set_timezone UTC"
+            )
+            return
+        
+        timezone = context.args[0]
+        # Проверяем существование часового пояса
+        try:
+            pytz.timezone(timezone)
+        except pytz.exceptions.UnknownTimeZoneError:
+            await update.message.reply_text(
+                f"❌ Неизвестный часовой пояс '{timezone}'. \n"
+                "Попробуйте: Europe/Moscow, Europe/London, America/New_York, Asia/Yekaterinburg, UTC"
+            )
+            return
+        
+        self.db.update_user_settings(update.effective_user.id, timezone=timezone)
+        await update.message.reply_text(f"✅ Часовой пояс установлен: {timezone}")
+    
+    async def toggle_auto(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Включает/выключает автоматическую мотивацию"""
+        user_id = update.effective_user.id
+        settings = self.db.get_user_settings(user_id)
+        
+        new_value = not settings['auto_motivation']
+        self.db.update_user_settings(user_id, auto_motivation=new_value)
+        
+        status = "включена" if new_value else "выключена"
+        await update.message.reply_text(f"✅ Автомотивация {status}")
+    
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обрабатывает нажатия на кнопки"""
+        query = update.callback_query
+        await query.answer()
+        
+        if query.data == "motivate":
+            await self._send_motivation(query.message.chat_id, context)
+        elif query.data == "stats":
+            # Создаем фейковый update для show_stats
+            class FakeUpdate:
+                def __init__(self, chat_id):
+                    self.effective_chat = type('obj', (object,), {'id': chat_id})
+                    self.message = type('obj', (object,), {'reply_text': query.message.reply_text})
+            
+            fake_update = FakeUpdate(query.message.chat_id)
+            await self.show_stats(fake_update, context)
+    
+    async def scheduled_motivation(self, context: ContextTypes.DEFAULT_TYPE):
+        """Запланированная отправка мотивации всем пользователям"""
+        try:
+            # Получаем всех пользователей из базы
+            with sqlite3.connect(self.db.db_path) as conn:
+                cursor = conn.execute("SELECT user_id, notify_time, timezone, auto_motivation FROM user_settings")
+                users = cursor.fetchall()
+            
+            for user_id, notify_time, timezone, auto_motivation in users:
+                if not auto_motivation:
+                    continue
+                
+                # Проверяем, нужно ли отправлять сейчас (с учетом часового пояса)
+                try:
+                    tz = pytz.timezone(timezone)
+                    now = datetime.now(tz)
+                    current_time = now.strftime("%H:%M")
+                    
+                    if current_time == notify_time:
+                        await self._send_motivation(user_id, context)
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке уведомления пользователю {user_id}: {e}")
+                    
+        except Exception as e:
+            logger.error(f"Ошибка в scheduled_motivation: {e}")
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показывает справку"""
+        help_text = """
+📚 **Справка по командам:**
+
+**Основные команды:**
+/tasks - показать невыполненные задачи
+/motivate - получить мотивацию
+/stats - статистика по задачам
+/settings - настройки уведомлений
+
+**Настройка:**
+/setpath /путь/к/logseq - установить путь к Logseq
+/set_time ЧЧ:ММ - установить время уведомлений
+/set_timezone Europe/Moscow - установить часовой пояс
+/toggle_auto - вкл/выкл автоматические уведомления
+
+**Другое:**
+/help - это сообщение
+
+**Как это работает:**
+1. Бот парсит все .md файлы в папках journals и pages
+2. Ищет задачи в форматах:
+   • TODO / DOING / DONE / LATER
+   • [ ] / [x] / [>]
+   • С приоритетами [A], [B], [C]
+   • С дедлайнами DEADLINE: <2024-01-15>
+   • С тегами #важно :работа:
+3. Генерирует мотивацию через локальную Ollama
+
+**Примеры задач:**
+- TODO Написать отчет DEADLINE: <2024-12-31> PRIORITY: высокий
+- DOING Работаю над проектом #важно
+- [ ] Купить продукты :дом:
+- LATER Изучить Python scheduled:: 2024-12-20
+        """
+        
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+    
+    def run(self):
+        """Запускает бота"""
+        # Создаем приложение
+        application = Application.builder().token(self.token).build()
+        
+        # Добавляем обработчики команд
+        application.add_handler(CommandHandler("start", self.start))
+        application.add_handler(CommandHandler("help", self.help_command))
+        application.add_handler(CommandHandler("setpath", self.set_path))
+        application.add_handler(CommandHandler("tasks", self.show_tasks))
+        application.add_handler(CommandHandler("motivate", self.motivate))
+        application.add_handler(CommandHandler("stats", self.show_stats))
+        application.add_handler(CommandHandler("settings", self.settings))
+        application.add_handler(CommandHandler("set_time", self.set_time))
+        application.add_handler(CommandHandler("set_timezone", self.set_timezone))
+        application.add_handler(CommandHandler("toggle_auto", self.toggle_auto))
+        
+        # Обработчик кнопок
+        application.add_handler(CallbackQueryHandler(self.button_callback))
+        
+        # Планировщик задач
+        job_queue = application.job_queue
+        if job_queue:
+            # Проверяем каждую минуту, нужно ли отправлять уведомления
+            job_queue.run_repeating(self.scheduled_motivation, interval=60, first=10)
+        
+        # Запускаем бота
+        print("🤖 Бот запущен...")
+        print(f"📁 Путь к Logseq: {self.logseq_path}")
+        print("⏰ Нажми Ctrl+C для остановки")
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+# Файл конфигурации
+def create_config():
+    """Создает файл конфигурации"""
+    config = """# Конфигурация бота
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Получите у @BotFather
+LOGSEQ_PATH = "/home/user/Documents/logseq"   # Путь к вашей базе Logseq
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "llama2"  # или "mistral", "codellama", "llama3", "phi"
+"""
+    
+    with open("config.py", "w") as f:
+        f.write(config)
+    
+    print("✅ Создан файл config.py. Отредактируйте его с вашими настройками.")
+
+# Файл зависимостей
+def create_requirements():
+    """Создает файл с зависимостями"""
+    requirements = """python-telegram-bot==20.7
+aiohttp==3.9.1
+aiofiles==23.2.1
+pytz==2023.3
+"""
+    
+    with open("requirements.txt", "w") as f:
+        f.write(requirements)
+    
+    print("✅ Создан файл requirements.txt")
+
+# Основной запуск
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--init":
+        create_config()
+        create_requirements()
+        print("""
+🚀 Инициализация завершена!
+
+Дальнейшие действия:
+
+1️⃣ Установите зависимости:
+   pip install -r requirements.txt
+
+2️⃣ Отредактируйте config.py:
+   - BOT_TOKEN: получите у @BotFather в Telegram
+   - LOGSEQ_PATH: укажите путь к вашей базе Logseq
+   - При необходимости измените модель Ollama
+
+3️⃣ Убедитесь, что Ollama запущена:
+   ollama serve
+   
+   И скачайте модель:
+   ollama pull llama2
+
+4️⃣ Запустите бота:
+   python bot.py
+
+5️⃣ В Telegram отправьте боту /start и настройте путь:
+   /setpath /путь/к/logseq
+
+6️⃣ Проверьте работу командой /tasks
+        """)
+    else:
+        try:
+            from config import BOT_TOKEN, LOGSEQ_PATH, OLLAMA_URL, OLLAMA_MODEL
+        except ImportError:
+            print("❌ Не найден файл config.py")
+            print("Запустите с параметром --init для создания:")
+            print("python bot.py --init")
+            sys.exit(1)
+        
+        # Проверяем наличие токена
+        if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+            print("❌ Не указан BOT_TOKEN в config.py")
+            print("Получите токен у @BotFather и отредактируйте config.py")
+            sys.exit(1)
+        
+        # Проверяем путь к Logseq
+        if LOGSEQ_PATH == "/home/user/Documents/logseq":
+            print("⚠️  Путь к Logseq не изменен в config.py")
+            print("   Укажите правильный путь или используйте /setpath в боте")
+        
+        bot = LogseqBot(BOT_TOKEN, LOGSEQ_PATH, OLLAMA_URL, OLLAMA_MODEL)
+        bot.run()
